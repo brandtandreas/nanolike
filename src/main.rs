@@ -131,41 +131,109 @@ impl App {
         ui::prompt(&mut self.stdout, msg, default, self.term_h, self.term_w)
     }
 
+    fn prompt_non_empty(&mut self, msg: &str, default: &str) -> io::Result<Option<String>> {
+        match self.prompt(msg, default)? {
+            Some(s) if !s.is_empty() => Ok(Some(s)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Save to the existing filename, or prompt for one if none is set.
+    /// Returns `true` if the file was saved successfully.
+    fn save_current_or_prompt(&mut self) -> io::Result<bool> {
+        if let Some(fname) = self.editor.filename.clone() {
+            return Ok(self.editor.save_file(&fname));
+        }
+        let fname = match self.prompt_non_empty("Save as: ", "")? {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        Ok(self.editor.save_file(&fname))
+    }
+
+    fn handle_quit(&mut self) -> io::Result<()> {
+        if !self.editor.modified {
+            self.running = false;
+            return Ok(());
+        }
+        let choice = match self.prompt("Save before quit? (y/n/[cancel]): ", "")? {
+            Some(c) => c,
+            None => return Ok(()), // Esc = cancel
+        };
+        match choice.trim().to_lowercase().as_str() {
+            "y" | "yes" => {
+                if self.save_current_or_prompt()? {
+                    self.running = false;
+                }
+            }
+            "n" | "no" => self.running = false,
+            _ => {} // cancel or anything else
+        }
+        Ok(())
+    }
+
+    fn handle_goto_line(&mut self) -> io::Result<()> {
+        let s = match self.prompt("Go to line: ", "")? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let n: usize = match s.trim().parse() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                self.editor.set_status("Invalid line number", true);
+                return Ok(());
+            }
+        };
+        let n0 = n - 1;
+        if n0 >= self.editor.lines.len() {
+            self.editor.set_status(format!("Line {} out of range", n), true);
+            return Ok(());
+        }
+        self.editor.goto_line(n0);
+        self.editor.set_status(format!("Jumped to line {}", n), false);
+        Ok(())
+    }
+
+    fn handle_replace(&mut self) -> io::Result<()> {
+        let default = self.editor.search_term.clone();
+        let term = match self.prompt_non_empty("Search: ", &default)? {
+            Some(t) => t,
+            None => {
+                self.editor.set_status("Replace cancelled", false);
+                return Ok(());
+            }
+        };
+        // Replacement may be empty (delete all occurrences).
+        let replacement = match self.prompt("Replace with: ", "")? {
+            Some(r) => r,
+            None => {
+                self.editor.set_status("Replace cancelled", false);
+                return Ok(());
+            }
+        };
+        let choice = match self.prompt("Replace all? (y/n): ", "")? {
+            Some(c) => c,
+            None => {
+                self.editor.set_status("Replace cancelled", false);
+                return Ok(());
+            }
+        };
+        self.editor.search_term = term.clone();
+        if choice.trim().to_lowercase().starts_with('y') {
+            self.editor.replace_all(&term, &replacement);
+            self.editor.search_matches.clear();
+        } else {
+            self.editor.build_search_matches();
+            self.editor.search_next();
+        }
+        Ok(())
+    }
+
     // ── Action dispatch ───────────────────────────────────────────────────────
 
     fn handle_action(&mut self, action: &str) -> io::Result<()> {
         match action {
-            "quit" => {
-                if self.editor.modified {
-                    match self.prompt("Save before quit? (y/n/[cancel]): ", "")? {
-                        Some(choice) => match choice.trim().to_lowercase().as_str() {
-                            "y" | "yes" => {
-                                let saved = if let Some(fname) = self.editor.filename.clone() {
-                                    self.editor.save_file(&fname)
-                                } else if let Some(fname) =
-                                    self.prompt("Save as: ", "")?
-                                {
-                                    if fname.is_empty() {
-                                        false
-                                    } else {
-                                        self.editor.save_file(&fname)
-                                    }
-                                } else {
-                                    false
-                                };
-                                if saved {
-                                    self.running = false;
-                                }
-                            }
-                            "n" | "no" => self.running = false,
-                            _ => {} // cancel or anything else
-                        },
-                        None => {} // Esc = cancel
-                    }
-                } else {
-                    self.running = false;
-                }
-            }
+            "quit" => self.handle_quit()?,
 
             "save" => {
                 if let Some(fname) = self.editor.filename.clone() {
@@ -244,59 +312,9 @@ impl App {
                 }
             }
 
-            "replace" => {
-                let default = self.editor.search_term.clone();
-                let term = match self.prompt("Search: ", &default)? {
-                    Some(t) if !t.is_empty() => t,
-                    _ => {
-                        self.editor.set_status("Replace cancelled", false);
-                        return Ok(());
-                    }
-                };
-                let replacement = match self.prompt("Replace with: ", "")? {
-                    Some(r) => r,
-                    None => {
-                        self.editor.set_status("Replace cancelled", false);
-                        return Ok(());
-                    }
-                };
-                let choice = match self.prompt("Replace all? (y/n): ", "")? {
-                    Some(c) => c,
-                    None => {
-                        self.editor.set_status("Replace cancelled", false);
-                        return Ok(());
-                    }
-                };
-                self.editor.search_term = term.clone();
-                if choice.trim().to_lowercase().starts_with('y') {
-                    self.editor.replace_all(&term, &replacement);
-                    self.editor.search_matches.clear();
-                } else {
-                    self.editor.build_search_matches();
-                    self.editor.search_next();
-                }
-            }
+            "replace" => self.handle_replace()?,
 
-            "goto_line" => {
-                match self.prompt("Go to line: ", "")? {
-                    Some(s) => match s.trim().parse::<usize>() {
-                        Ok(n) if n >= 1 => {
-                            let n0 = n - 1;
-                            if n0 < self.editor.lines.len() {
-                                self.editor.goto_line(n0);
-                                self.editor.set_status(format!("Jumped to line {}", n), false);
-                            } else {
-                                self.editor.set_status(
-                                    format!("Line {} out of range", n),
-                                    true,
-                                );
-                            }
-                        }
-                        _ => self.editor.set_status("Invalid line number", true),
-                    },
-                    None => {}
-                }
-            }
+            "goto_line" => self.handle_goto_line()?,
 
             "page_up" => self.editor.move_page_up(self.text_height()),
             "page_down" => self.editor.move_page_down(self.text_height()),

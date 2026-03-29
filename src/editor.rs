@@ -472,21 +472,10 @@ impl Editor {
             return;
         }
         let term_lower = self.search_term.to_lowercase();
-        let term_len = term_lower.len();
         for (row, line) in self.lines.iter().enumerate() {
             let line_lower = line.to_lowercase();
-            let mut start = 0usize;
-            while start + term_len <= line_lower.len() {
-                if line_lower[start..].starts_with(&term_lower) {
-                    self.search_matches.push((row, start));
-                    start += term_len;
-                } else {
-                    start += line_lower[start..]
-                        .chars()
-                        .next()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(1);
-                }
+            for col in find_matches_in_line(&line_lower, &term_lower) {
+                self.search_matches.push((row, col));
             }
         }
     }
@@ -598,6 +587,23 @@ impl Editor {
             self.scroll_col = char_col + 1 - text_width;
         }
     }
+}
+
+/// Returns the byte offsets of all non-overlapping occurrences of `term_lower`
+/// in `line_lower`. Both arguments must already be lowercase.
+fn find_matches_in_line(line_lower: &str, term_lower: &str) -> Vec<usize> {
+    let term_len = term_lower.len();
+    let mut matches = Vec::new();
+    let mut start = 0usize;
+    while start + term_len <= line_lower.len() {
+        if line_lower[start..].starts_with(term_lower) {
+            matches.push(start);
+            start += term_len;
+        } else {
+            start += line_lower[start..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+    }
+    matches
 }
 
 /// Convert a char index to a byte offset in `s`, clamped to `s.len()`.

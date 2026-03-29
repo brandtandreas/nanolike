@@ -42,14 +42,13 @@ impl Default for Config {
 impl Config {
     pub fn load() -> Self {
         let path = config_path();
-        if path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(cfg) = serde_json::from_str(&data) {
-                    return cfg;
-                }
-            }
+        if !path.exists() {
+            return Self::default();
         }
-        Self::default()
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_default()
     }
 
     pub fn save(&self) {
@@ -120,14 +119,14 @@ impl KeyBindings {
     fn load_bindings() -> HashMap<String, Vec<String>> {
         let mut merged = default_keybindings();
         let path = keybindings_path();
-        if path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(user) = serde_json::from_str::<HashMap<String, Vec<String>>>(&data) {
-                    for (k, v) in user {
-                        merged.insert(k, v);
-                    }
-                }
-            }
+        if !path.exists() {
+            return merged;
+        }
+        if let Some(user) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<HashMap<String, Vec<String>>>(&data).ok())
+        {
+            merged.extend(user);
         }
         merged
     }
