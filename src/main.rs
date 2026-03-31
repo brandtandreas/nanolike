@@ -195,6 +195,25 @@ impl App {
         Ok(())
     }
 
+    fn handle_open_file(&mut self) -> io::Result<()> {
+        let fname = match self.prompt_non_empty("Open file: ", "")? {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        // If the current tab is a pristine empty buffer, reuse it.
+        let current_is_empty = {
+            let ed = &self.editors[self.active_tab];
+            ed.filename.is_none() && !ed.modified && ed.lines == vec![String::new()]
+        };
+        if current_is_empty {
+            self.editors[self.active_tab] = Editor::new(Some(fname));
+        } else {
+            self.editors.push(Editor::new(Some(fname)));
+            self.active_tab = self.editors.len() - 1;
+        }
+        Ok(())
+    }
+
     fn handle_close_tab(&mut self) -> io::Result<()> {
         if self.editors[self.active_tab].modified {
             let choice = match self.prompt("Save before closing tab? (y/n/[cancel]): ", "")? {
@@ -419,6 +438,8 @@ impl App {
                     false,
                 );
             }
+
+            "open_file" => self.handle_open_file()?,
 
             "next_tab" => {
                 if self.editors.len() > 1 {

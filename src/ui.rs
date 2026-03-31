@@ -377,6 +377,7 @@ fn draw_help_bar(stdout: &mut impl Write, kb: &KeyBindings, h: usize, w: usize) 
         ("paste",     "Paste"),
         ("select_all","Sel All"),
         ("redo",      "Redo"),
+        ("open_file", "Open"),
         ("help",      "Help"),
     ];
 
