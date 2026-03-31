@@ -115,7 +115,7 @@ impl App {
     }
 
     fn text_height(&self) -> usize {
-        self.term_h.saturating_sub(3)
+        self.term_h.saturating_sub(4)
     }
 
     fn text_width(&self) -> usize {

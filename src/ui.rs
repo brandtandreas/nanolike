@@ -32,11 +32,11 @@ pub fn render(
     let w = term_w as usize;
     let h = term_h as usize;
 
-    if h < 4 || w < 10 {
+    if h < 5 || w < 10 {
         return Ok(());
     }
 
-    let text_height = h - 3; // title row + status row + help row
+    let text_height = h - 4; // title row + status row + 2 help rows
     let lnw = line_number_width(editor, config);
     let text_width = w.saturating_sub(lnw);
 
@@ -51,7 +51,7 @@ pub fn render(
     let screen_row = editor.cursor_row.saturating_sub(editor.scroll_row) + 1;
     let char_col = editor.cursor_char_col();
     let screen_col = char_col.saturating_sub(editor.scroll_col) + lnw;
-    if screen_row < h - 2 && screen_col < w {
+    if screen_row < h - 3 && screen_col < w {
         queue!(
             stdout,
             cursor::MoveTo(screen_col as u16, screen_row as u16),
@@ -261,7 +261,7 @@ fn draw_status_bar(stdout: &mut impl Write, editor: &Editor, h: usize, w: usize)
 
     queue!(
         stdout,
-        cursor::MoveTo(0, (h - 2) as u16),
+        cursor::MoveTo(0, (h - 3) as u16),
         SetBackgroundColor(Color::White),
         SetForegroundColor(Color::Black),
         style::Print(truncate_chars(&full_line, w)),
@@ -278,7 +278,7 @@ fn draw_status_bar(stdout: &mut impl Write, editor: &Editor, h: usize, w: usize)
         let display = truncate_chars(&msg, msg_width);
         queue!(
             stdout,
-            cursor::MoveTo(0, (h - 2) as u16),
+            cursor::MoveTo(0, (h - 3) as u16),
             SetBackgroundColor(Color::White),
             SetForegroundColor(msg_col),
             SetAttribute(Attribute::Bold),
@@ -290,37 +290,89 @@ fn draw_status_bar(stdout: &mut impl Write, editor: &Editor, h: usize, w: usize)
 }
 
 fn draw_help_bar(stdout: &mut impl Write, kb: &KeyBindings, h: usize, w: usize) -> io::Result<()> {
-    let shortcuts = [
-        ("quit", "Quit"),
-        ("save", "Save"),
-        ("search", "Search"),
-        ("replace", "Replace"),
+    let row1: &[(&str, &str)] = &[
+        ("quit",      "Quit"),
+        ("save",      "Save"),
+        ("search",    "Search"),
+        ("replace",   "Replace"),
         ("goto_line", "GoTo"),
-        ("cut_line", "Cut"),
-        ("paste", "Paste"),
-        ("help", "Help"),
-        ("undo", "Undo"),
-        ("redo", "Redo"),
+        ("undo",      "Undo"),
     ];
+    let row2: &[(&str, &str)] = &[
+        ("cut_line",  "Cut"),
+        ("copy_line", "Copy"),
+        ("paste",     "Paste"),
+        ("select_all","Sel All"),
+        ("redo",      "Redo"),
+        ("help",      "Help"),
+    ];
+    draw_help_row(stdout, row1, kb, (h - 2) as u16, w)?;
+    draw_help_row(stdout, row2, kb, (h - 1) as u16, w)
+}
 
-    let mut bar = String::new();
-    for (action, label) in &shortcuts {
-        let key = kb.first_key(action);
-        let entry = format!(" {} {} ", key, label);
-        if bar.len() + entry.len() > w {
-            break;
-        }
-        bar.push_str(&entry);
-    }
+fn draw_help_row(
+    stdout: &mut impl Write,
+    shortcuts: &[(&str, &str)],
+    kb: &KeyBindings,
+    y: u16,
+    w: usize,
+) -> io::Result<()> {
+    const BG: Color = Color::DarkBlue;
 
+    // Fill the row with the background colour.
     queue!(
         stdout,
-        cursor::MoveTo(0, (h - 1) as u16),
-        SetBackgroundColor(Color::Cyan),
-        SetForegroundColor(Color::Black),
-        style::Print(format!("{:<width$}", bar, width = w)),
-        ResetColor,
-    )
+        cursor::MoveTo(0, y),
+        SetBackgroundColor(BG),
+        style::Print(format!("{:width$}", "", width = w)),
+        cursor::MoveTo(0, y),
+    )?;
+
+    let mut x = 0usize;
+    let mut first = true;
+
+    for (action, label) in shortcuts {
+        let key = kb.first_key(action);
+
+        // Separator between entries.
+        let sep = if first { " " } else { "  \u{2502}  " }; // "  │  "
+        let entry_chars = sep.chars().count() + key.chars().count() + 1 + label.chars().count();
+        if x + entry_chars >= w {
+            break;
+        }
+
+        // Separator / leading space.
+        queue!(
+            stdout,
+            SetBackgroundColor(BG),
+            SetForegroundColor(Color::DarkCyan),
+            style::Print(sep),
+        )?;
+        x += sep.chars().count();
+        first = false;
+
+        // Key: bold white.
+        queue!(
+            stdout,
+            SetBackgroundColor(BG),
+            SetForegroundColor(Color::White),
+            SetAttribute(Attribute::Bold),
+            style::Print(key),
+            SetAttribute(Attribute::Reset),
+        )?;
+        x += key.chars().count();
+
+        // Label: normal cyan (re-apply BG after attribute reset).
+        queue!(
+            stdout,
+            SetBackgroundColor(BG),
+            SetForegroundColor(Color::Cyan),
+            style::Print(format!(" {}", label)),
+        )?;
+        x += 1 + label.chars().count();
+    }
+
+    queue!(stdout, ResetColor)
 }
 
 // ── Interactive prompt ────────────────────────────────────────────────────────
@@ -341,13 +393,13 @@ pub fn prompt(
         let padded = format!("{:<width$}", display, width = w);
         queue!(
             stdout,
-            cursor::MoveTo(0, (h - 2) as u16),
+            cursor::MoveTo(0, (h - 3) as u16),
             SetBackgroundColor(Color::White),
             SetForegroundColor(Color::Black),
             SetAttribute(Attribute::Bold),
             style::Print(truncate_chars(&padded, w)),
             ResetColor,
-            cursor::MoveTo((msg.len() + buf.len()).min(w.saturating_sub(1)) as u16, (h - 2) as u16),
+            cursor::MoveTo((msg.len() + buf.len()).min(w.saturating_sub(1)) as u16, (h - 3) as u16),
             cursor::Show,
         )?;
         stdout.flush()?;
