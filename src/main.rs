@@ -91,7 +91,8 @@ impl Drop for TerminalGuard {
 // ── Application state ─────────────────────────────────────────────────────────
 
 struct App {
-    editor: Editor,
+    editors: Vec<Editor>,
+    active_tab: usize,
     config: Config,
     kb: KeyBindings,
     stdout: io::Stdout,
@@ -101,10 +102,16 @@ struct App {
 }
 
 impl App {
-    fn new(filename: Option<String>) -> io::Result<Self> {
+    fn new(filenames: Vec<String>) -> io::Result<Self> {
         let (w, h) = terminal::size()?;
+        let editors = if filenames.is_empty() {
+            vec![Editor::new(None)]
+        } else {
+            filenames.into_iter().map(|f| Editor::new(Some(f))).collect()
+        };
         Ok(Self {
-            editor: Editor::new(filename),
+            editors,
+            active_tab: 0,
             config: Config::load(),
             kb: KeyBindings::load(),
             stdout: stdout(),
@@ -119,12 +126,12 @@ impl App {
     }
 
     fn text_width(&self) -> usize {
-        let lnw = ui::line_number_width(&self.editor, &self.config);
+        let lnw = ui::line_number_width(&self.editors[self.active_tab], &self.config);
         self.term_w.saturating_sub(lnw)
     }
 
     fn render(&mut self) -> io::Result<()> {
-        ui::render(&mut self.stdout, &self.editor, &self.config, &self.kb)
+        ui::render(&mut self.stdout, &self.editors, self.active_tab, &self.config, &self.kb)
     }
 
     fn prompt(&mut self, msg: &str, default: &str) -> io::Result<Option<String>> {
@@ -138,36 +145,77 @@ impl App {
         }
     }
 
-    /// Save to the existing filename, or prompt for one if none is set.
+    /// Save the active tab to its filename, or prompt for one if not set.
     /// Returns `true` if the file was saved successfully.
     fn save_current_or_prompt(&mut self) -> io::Result<bool> {
-        if let Some(fname) = self.editor.filename.clone() {
-            return Ok(self.editor.save_file(&fname));
+        let fname = self.editors[self.active_tab].filename.clone();
+        if let Some(fname) = fname {
+            return Ok(self.editors[self.active_tab].save_file(&fname));
         }
         let fname = match self.prompt_non_empty("Save as: ", "")? {
             Some(f) => f,
             None => return Ok(false),
         };
-        Ok(self.editor.save_file(&fname))
+        Ok(self.editors[self.active_tab].save_file(&fname))
     }
 
     fn handle_quit(&mut self) -> io::Result<()> {
-        if !self.editor.modified {
+        let modified_indices: Vec<usize> = (0..self.editors.len())
+            .filter(|&i| self.editors[i].modified)
+            .collect();
+        if modified_indices.is_empty() {
             self.running = false;
             return Ok(());
         }
-        let choice = match self.prompt("Save before quit? (y/n/[cancel]): ", "")? {
+        let msg = if modified_indices.len() == 1 {
+            "Save before quit? (y/n/[cancel]): ".to_string()
+        } else {
+            format!(
+                "{} tabs have unsaved changes. Save all? (y/n/[cancel]): ",
+                modified_indices.len()
+            )
+        };
+        let choice = match self.prompt(&msg, "")? {
             Some(c) => c,
             None => return Ok(()), // Esc = cancel
         };
         match choice.trim().to_lowercase().as_str() {
             "y" | "yes" => {
-                if self.save_current_or_prompt()? {
-                    self.running = false;
+                for i in modified_indices {
+                    self.active_tab = i;
+                    if !self.save_current_or_prompt()? {
+                        return Ok(()); // save cancelled or failed — abort quit
+                    }
                 }
+                self.running = false;
             }
             "n" | "no" => self.running = false,
-            _ => {} // cancel or anything else
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_close_tab(&mut self) -> io::Result<()> {
+        if self.editors[self.active_tab].modified {
+            let choice = match self.prompt("Save before closing tab? (y/n/[cancel]): ", "")? {
+                Some(c) => c,
+                None => return Ok(()), // Esc = cancel
+            };
+            match choice.trim().to_lowercase().as_str() {
+                "y" | "yes" => {
+                    if !self.save_current_or_prompt()? {
+                        return Ok(());
+                    }
+                }
+                "n" | "no" => {}
+                _ => return Ok(()),
+            }
+        }
+        self.editors.remove(self.active_tab);
+        if self.editors.is_empty() {
+            self.running = false;
+        } else {
+            self.active_tab = self.active_tab.min(self.editors.len() - 1);
         }
         Ok(())
     }
@@ -180,26 +228,26 @@ impl App {
         let n: usize = match s.trim().parse() {
             Ok(n) if n >= 1 => n,
             _ => {
-                self.editor.set_status("Invalid line number", true);
+                self.editors[self.active_tab].set_status("Invalid line number", true);
                 return Ok(());
             }
         };
         let n0 = n - 1;
-        if n0 >= self.editor.lines.len() {
-            self.editor.set_status(format!("Line {} out of range", n), true);
+        if n0 >= self.editors[self.active_tab].lines.len() {
+            self.editors[self.active_tab].set_status(format!("Line {} out of range", n), true);
             return Ok(());
         }
-        self.editor.goto_line(n0);
-        self.editor.set_status(format!("Jumped to line {}", n), false);
+        self.editors[self.active_tab].goto_line(n0);
+        self.editors[self.active_tab].set_status(format!("Jumped to line {}", n), false);
         Ok(())
     }
 
     fn handle_replace(&mut self) -> io::Result<()> {
-        let default = self.editor.search_term.clone();
+        let default = self.editors[self.active_tab].search_term.clone();
         let term = match self.prompt_non_empty("Search: ", &default)? {
             Some(t) => t,
             None => {
-                self.editor.set_status("Replace cancelled", false);
+                self.editors[self.active_tab].set_status("Replace cancelled", false);
                 return Ok(());
             }
         };
@@ -207,24 +255,24 @@ impl App {
         let replacement = match self.prompt("Replace with: ", "")? {
             Some(r) => r,
             None => {
-                self.editor.set_status("Replace cancelled", false);
+                self.editors[self.active_tab].set_status("Replace cancelled", false);
                 return Ok(());
             }
         };
         let choice = match self.prompt("Replace all? (y/n): ", "")? {
             Some(c) => c,
             None => {
-                self.editor.set_status("Replace cancelled", false);
+                self.editors[self.active_tab].set_status("Replace cancelled", false);
                 return Ok(());
             }
         };
-        self.editor.search_term = term.clone();
+        self.editors[self.active_tab].search_term = term.clone();
         if choice.trim().to_lowercase().starts_with('y') {
-            self.editor.replace_all(&term, &replacement);
-            self.editor.search_matches.clear();
+            self.editors[self.active_tab].replace_all(&term, &replacement);
+            self.editors[self.active_tab].search_matches.clear();
         } else {
-            self.editor.build_search_matches();
-            self.editor.search_next();
+            self.editors[self.active_tab].build_search_matches();
+            self.editors[self.active_tab].search_next();
         }
         Ok(())
     }
@@ -232,29 +280,31 @@ impl App {
     // ── Action dispatch ───────────────────────────────────────────────────────
 
     fn handle_action(&mut self, action: &str) -> io::Result<()> {
+        let t = self.active_tab;
         match action {
             "quit" => self.handle_quit()?,
 
             "save" => {
-                if let Some(fname) = self.editor.filename.clone() {
-                    self.editor.save_file(&fname);
+                let fname = self.editors[t].filename.clone();
+                if let Some(fname) = fname {
+                    self.editors[t].save_file(&fname);
                 } else {
                     match self.prompt("Save as: ", "")? {
                         Some(fname) if !fname.is_empty() => {
-                            self.editor.save_file(&fname);
+                            self.editors[self.active_tab].save_file(&fname);
                         }
-                        _ => self.editor.set_status("Save cancelled", false),
+                        _ => self.editors[self.active_tab].set_status("Save cancelled", false),
                     }
                 }
             }
 
             "save_as" => {
-                let default = self.editor.filename.clone().unwrap_or_default();
+                let default = self.editors[t].filename.clone().unwrap_or_default();
                 match self.prompt("Save as: ", &default)? {
                     Some(fname) if !fname.is_empty() => {
-                        self.editor.save_file(&fname);
+                        self.editors[self.active_tab].save_file(&fname);
                     }
-                    _ => self.editor.set_status("Save cancelled", false),
+                    _ => self.editors[self.active_tab].set_status("Save cancelled", false),
                 }
             }
 
@@ -262,52 +312,55 @@ impl App {
                 ui::show_help(&mut self.stdout, &self.kb, self.term_h, self.term_w)?;
             }
 
-            "cut_line" => self.editor.cut_line(),
-            "copy_line" => self.editor.copy_line(),
-            "paste" => self.editor.paste(),
+            "cut_line"  => self.editors[t].cut_line(),
+            "copy_line" => self.editors[t].copy_line(),
+            "paste"     => self.editors[t].paste(),
 
             "search" => {
-                let default = self.editor.search_term.clone();
+                let default = self.editors[t].search_term.clone();
                 match self.prompt("Search: ", &default)? {
                     Some(term) if !term.is_empty() => {
-                        self.editor.search_term = term;
-                        self.editor.build_search_matches();
-                        if self.editor.search_matches.is_empty() {
-                            let msg = format!("Not found: {}", self.editor.search_term);
-                            self.editor.set_status(msg, true);
+                        self.editors[self.active_tab].search_term = term;
+                        self.editors[self.active_tab].build_search_matches();
+                        if self.editors[self.active_tab].search_matches.is_empty() {
+                            let msg =
+                                format!("Not found: {}", self.editors[self.active_tab].search_term);
+                            self.editors[self.active_tab].set_status(msg, true);
                         } else {
-                            self.editor.search_next();
+                            self.editors[self.active_tab].search_next();
                         }
                     }
                     Some(_) => {
-                        self.editor.search_term.clear();
-                        self.editor.search_matches.clear();
-                        self.editor.set_status("Search cleared", false);
+                        self.editors[self.active_tab].search_term.clear();
+                        self.editors[self.active_tab].search_matches.clear();
+                        self.editors[self.active_tab].set_status("Search cleared", false);
                     }
-                    None => self.editor.set_status("Search cancelled", false),
+                    None => self.editors[self.active_tab].set_status("Search cancelled", false),
                 }
             }
 
             "search_next" => {
-                if self.editor.search_term.is_empty() {
+                if self.editors[t].search_term.is_empty() {
                     self.handle_action("search")?;
                 } else {
-                    self.editor.build_search_matches();
-                    if !self.editor.search_next() {
-                        let msg = format!("Not found: {}", self.editor.search_term);
-                        self.editor.set_status(msg, true);
+                    self.editors[self.active_tab].build_search_matches();
+                    if !self.editors[self.active_tab].search_next() {
+                        let msg =
+                            format!("Not found: {}", self.editors[self.active_tab].search_term);
+                        self.editors[self.active_tab].set_status(msg, true);
                     }
                 }
             }
 
             "search_prev" => {
-                if self.editor.search_term.is_empty() {
+                if self.editors[t].search_term.is_empty() {
                     self.handle_action("search")?;
                 } else {
-                    self.editor.build_search_matches();
-                    if !self.editor.search_prev() {
-                        let msg = format!("Not found: {}", self.editor.search_term);
-                        self.editor.set_status(msg, true);
+                    self.editors[self.active_tab].build_search_matches();
+                    if !self.editors[self.active_tab].search_prev() {
+                        let msg =
+                            format!("Not found: {}", self.editors[self.active_tab].search_term);
+                        self.editors[self.active_tab].set_status(msg, true);
                     }
                 }
             }
@@ -316,36 +369,36 @@ impl App {
 
             "goto_line" => self.handle_goto_line()?,
 
-            "page_up" => self.editor.move_page_up(self.text_height()),
-            "page_down" => self.editor.move_page_down(self.text_height()),
+            "page_up"   => { let h = self.text_height(); self.editors[t].move_page_up(h); }
+            "page_down" => { let h = self.text_height(); self.editors[t].move_page_down(h); }
 
             "file_top" => {
-                self.editor.selection_anchor = None;
-                self.editor.cursor_row = 0;
-                self.editor.cursor_col = 0;
+                self.editors[t].selection_anchor = None;
+                self.editors[t].cursor_row = 0;
+                self.editors[t].cursor_col = 0;
             }
             "file_bottom" => {
-                self.editor.selection_anchor = None;
-                self.editor.cursor_row = self.editor.lines.len().saturating_sub(1);
-                self.editor.cursor_col =
-                    self.editor.lines.last().map(|l| l.len()).unwrap_or(0);
+                self.editors[t].selection_anchor = None;
+                self.editors[t].cursor_row = self.editors[t].lines.len().saturating_sub(1);
+                self.editors[t].cursor_col =
+                    self.editors[t].lines.last().map(|l| l.len()).unwrap_or(0);
             }
 
-            "select_all" => self.editor.select_all(),
+            "select_all" => self.editors[t].select_all(),
 
-            "undo" => self.editor.do_undo(),
-            "redo" => self.editor.do_redo(),
+            "undo" => self.editors[t].do_undo(),
+            "redo" => self.editors[t].do_redo(),
 
-            "next_word" => self.editor.move_next_word(),
-            "prev_word" => self.editor.move_prev_word(),
-            "delete_word" => self.editor.delete_word_before(),
-            "delete_to_eol" => self.editor.delete_to_eol(),
+            "next_word"    => self.editors[t].move_next_word(),
+            "prev_word"    => self.editors[t].move_prev_word(),
+            "delete_word"  => self.editors[t].delete_word_before(),
+            "delete_to_eol"=> self.editors[t].delete_to_eol(),
 
             "toggle_line_numbers" => {
                 self.config.line_numbers = !self.config.line_numbers;
                 self.config.save();
                 let on = self.config.line_numbers;
-                self.editor.set_status(
+                self.editors[t].set_status(
                     format!("Line numbers {}", if on { "on" } else { "off" }),
                     false,
                 );
@@ -354,17 +407,34 @@ impl App {
                 self.config.word_wrap = !self.config.word_wrap;
                 self.config.save();
                 let on = self.config.word_wrap;
-                self.editor
+                self.editors[t]
                     .set_status(format!("Word wrap {}", if on { "on" } else { "off" }), false);
             }
             "toggle_auto_indent" => {
                 self.config.auto_indent = !self.config.auto_indent;
                 self.config.save();
                 let on = self.config.auto_indent;
-                self.editor.set_status(
+                self.editors[t].set_status(
                     format!("Auto-indent {}", if on { "on" } else { "off" }),
                     false,
                 );
+            }
+
+            "next_tab" => {
+                if self.editors.len() > 1 {
+                    self.active_tab = (self.active_tab + 1) % self.editors.len();
+                }
+            }
+            "prev_tab" => {
+                if self.editors.len() > 1 {
+                    self.active_tab =
+                        (self.active_tab + self.editors.len() - 1) % self.editors.len();
+                }
+            }
+            "close_tab" => self.handle_close_tab()?,
+            "new_tab"   => {
+                self.editors.push(Editor::new(None));
+                self.active_tab = self.editors.len() - 1;
             }
 
             _ => {}
@@ -398,92 +468,103 @@ impl App {
 
         match ev.code {
             KeyCode::Up if !ctrl && !alt => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_up();
+                if shift { self.set_anchor_if_none(); } else { self.editors[self.active_tab].selection_anchor = None; }
+                self.editors[self.active_tab].move_up();
                 return Ok(());
             }
             KeyCode::Down if !ctrl && !alt => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_down();
+                if shift { self.set_anchor_if_none(); } else { self.editors[self.active_tab].selection_anchor = None; }
+                self.editors[self.active_tab].move_down();
                 return Ok(());
             }
             KeyCode::Left if !ctrl && !alt => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_left();
+                if shift { self.set_anchor_if_none(); } else { self.editors[self.active_tab].selection_anchor = None; }
+                self.editors[self.active_tab].move_left();
                 return Ok(());
             }
             KeyCode::Right if !ctrl && !alt => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_right();
+                if shift { self.set_anchor_if_none(); } else { self.editors[self.active_tab].selection_anchor = None; }
+                self.editors[self.active_tab].move_right();
                 return Ok(());
             }
             // Ctrl+Left / Ctrl+Right  (also handles Shift+Ctrl variants)
             KeyCode::Left if ctrl && !alt => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_prev_word();
+                if shift { self.set_anchor_if_none(); } else { self.editors[self.active_tab].selection_anchor = None; }
+                self.editors[self.active_tab].move_prev_word();
                 return Ok(());
             }
             KeyCode::Right if ctrl && !alt => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_next_word();
+                if shift { self.set_anchor_if_none(); } else { self.editors[self.active_tab].selection_anchor = None; }
+                self.editors[self.active_tab].move_next_word();
                 return Ok(());
             }
             KeyCode::Home if !ctrl => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_home();
+                if shift { self.set_anchor_if_none(); } else { self.editors[self.active_tab].selection_anchor = None; }
+                self.editors[self.active_tab].move_home();
                 return Ok(());
             }
             KeyCode::End if !ctrl => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_end();
+                if shift { self.set_anchor_if_none(); } else { self.editors[self.active_tab].selection_anchor = None; }
+                self.editors[self.active_tab].move_end();
                 return Ok(());
             }
             KeyCode::Home if ctrl => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.cursor_row = 0;
-                self.editor.cursor_col = 0;
+                let t = self.active_tab;
+                if shift { self.set_anchor_if_none(); } else { self.editors[t].selection_anchor = None; }
+                self.editors[self.active_tab].cursor_row = 0;
+                self.editors[self.active_tab].cursor_col = 0;
                 return Ok(());
             }
             KeyCode::End if ctrl => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.cursor_row = self.editor.lines.len().saturating_sub(1);
-                self.editor.cursor_col = self.editor.lines.last().map(|l| l.len()).unwrap_or(0);
+                let t = self.active_tab;
+                if shift { self.set_anchor_if_none(); } else { self.editors[t].selection_anchor = None; }
+                let last = self.editors[t].lines.len().saturating_sub(1);
+                let last_col = self.editors[t].lines.last().map(|l| l.len()).unwrap_or(0);
+                self.editors[t].cursor_row = last;
+                self.editors[t].cursor_col = last_col;
                 return Ok(());
             }
             KeyCode::PageUp => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_page_up(self.text_height());
+                let t = self.active_tab;
+                if shift { self.set_anchor_if_none(); } else { self.editors[t].selection_anchor = None; }
+                let h = self.text_height();
+                self.editors[t].move_page_up(h);
                 return Ok(());
             }
             KeyCode::PageDown => {
-                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
-                self.editor.move_page_down(self.text_height());
+                let t = self.active_tab;
+                if shift { self.set_anchor_if_none(); } else { self.editors[t].selection_anchor = None; }
+                let h = self.text_height();
+                self.editors[t].move_page_down(h);
                 return Ok(());
             }
             KeyCode::Enter => {
-                self.editor.insert_newline(self.config.auto_indent);
+                let ai = self.config.auto_indent;
+                self.editors[self.active_tab].insert_newline(ai);
                 return Ok(());
             }
             KeyCode::Backspace if !ctrl && !alt => {
-                self.editor.backspace();
+                self.editors[self.active_tab].backspace();
                 return Ok(());
             }
             KeyCode::Delete if !ctrl && !alt => {
-                self.editor.delete_char();
+                self.editors[self.active_tab].delete_char();
                 return Ok(());
             }
             KeyCode::Tab => {
-                if self.config.use_spaces {
-                    self.editor.insert_str(&" ".repeat(self.config.tab_size));
+                let spaces = self.config.use_spaces;
+                let tab_size = self.config.tab_size;
+                if spaces {
+                    self.editors[self.active_tab].insert_str(&" ".repeat(tab_size));
                 } else {
-                    self.editor.insert_char('\t');
+                    self.editors[self.active_tab].insert_char('\t');
                 }
                 return Ok(());
             }
             KeyCode::Esc => {
                 // Clear selection on Escape (fall through to keybinding lookup
                 // so a bound "escape" action still fires, but clear first).
-                self.editor.selection_anchor = None;
+                self.editors[self.active_tab].selection_anchor = None;
             }
             _ => {}
         }
@@ -497,7 +578,7 @@ impl App {
         // ── Printable character fallthrough ───────────────────────────────────
         if let KeyCode::Char(c) = ev.code {
             if !ctrl && !alt {
-                self.editor.insert_char(c);
+                self.editors[self.active_tab].insert_char(c);
             }
         }
 
@@ -507,9 +588,10 @@ impl App {
     /// Set `selection_anchor` to the current cursor position, but only if no
     /// anchor is already set (so extending an existing selection doesn't reset it).
     fn set_anchor_if_none(&mut self) {
-        if self.editor.selection_anchor.is_none() {
-            self.editor.selection_anchor =
-                Some((self.editor.cursor_row, self.editor.cursor_col));
+        let t = self.active_tab;
+        if self.editors[t].selection_anchor.is_none() {
+            self.editors[t].selection_anchor =
+                Some((self.editors[t].cursor_row, self.editors[t].cursor_col));
         }
     }
 
@@ -525,8 +607,9 @@ impl App {
             self.term_w = w as usize;
             self.term_h = h as usize;
 
-            self.editor
-                .update_scroll(self.text_height(), self.text_width());
+            let th = self.text_height();
+            let tw = self.text_width();
+            self.editors[self.active_tab].update_scroll(th, tw);
             self.render()?;
 
             match event::read()? {
@@ -550,7 +633,7 @@ fn main() {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("NanoLike - A nano-inspired terminal editor (Rust)");
         println!();
-        println!("Usage:  nanolike [OPTIONS] [FILE]");
+        println!("Usage:  nanolike [OPTIONS] [FILE...]");
         println!();
         println!("Options:");
         println!("  --export-keybindings  Write default keybindings to config dir and exit");
@@ -579,13 +662,14 @@ fn main() {
         return;
     }
 
-    let filename = args
+    let filenames: Vec<String> = args
         .iter()
         .skip(1)
-        .find(|a| !a.starts_with('-'))
-        .cloned();
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .collect();
 
-    let mut app = match App::new(filename) {
+    let mut app = match App::new(filenames) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("Error: {}", e);

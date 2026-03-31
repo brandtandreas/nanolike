@@ -90,6 +90,10 @@ pub fn default_keybindings() -> HashMap<String, Vec<String>> {
         ("toggle_line_numbers",  &["alt+n"]),
         ("toggle_word_wrap",     &["alt+w"]),
         ("toggle_auto_indent",   &["alt+i"]),
+        ("next_tab",             &["alt+."]),
+        ("prev_tab",             &["alt+,"]),
+        ("close_tab",            &["ctrl+w"]),
+        ("new_tab",              &["ctrl+t"]),
     ]
     .iter()
     .map(|(k, v)| {

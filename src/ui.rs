@@ -24,7 +24,8 @@ pub fn line_number_width(editor: &Editor, config: &Config) -> usize {
 /// Render the full UI to `stdout`.
 pub fn render(
     stdout: &mut impl Write,
-    editor: &Editor,
+    editors: &[Editor],
+    active_tab: usize,
     config: &Config,
     kb: &KeyBindings,
 ) -> io::Result<()> {
@@ -36,13 +37,14 @@ pub fn render(
         return Ok(());
     }
 
-    let text_height = h - 4; // title row + status row + 2 help rows
+    let editor = &editors[active_tab];
+    let text_height = h - 4; // tab row + status row + 2 help rows
     let lnw = line_number_width(editor, config);
     let text_width = w.saturating_sub(lnw);
 
     queue!(stdout, terminal::Clear(terminal::ClearType::All), cursor::Hide)?;
 
-    draw_title_bar(stdout, editor, w)?;
+    draw_tab_bar(stdout, editors, active_tab, w)?;
     draw_text_area(stdout, editor, text_height, text_width, lnw, w)?;
     draw_status_bar(stdout, editor, h, w)?;
     draw_help_bar(stdout, kb, h, w)?;
@@ -62,20 +64,91 @@ pub fn render(
     stdout.flush()
 }
 
-fn draw_title_bar(stdout: &mut impl Write, editor: &Editor, w: usize) -> io::Result<()> {
-    let name = editor.filename.as_deref().unwrap_or("New Buffer");
-    let modified = if editor.modified { " [Modified]" } else { "" };
-    let title = format!(" NanoLike \u{2014} {}{} ", name, modified);
-    let padded = center_str(&title, w);
+fn draw_tab_bar(
+    stdout: &mut impl Write,
+    editors: &[Editor],
+    active_tab: usize,
+    w: usize,
+) -> io::Result<()> {
+    // Fill entire row with the bar background first.
     queue!(
         stdout,
         cursor::MoveTo(0, 0),
-        SetBackgroundColor(Color::Blue),
-        SetForegroundColor(Color::White),
-        SetAttribute(Attribute::Bold),
-        style::Print(&padded),
-        ResetColor,
-    )
+        SetBackgroundColor(Color::DarkBlue),
+        style::Print(format!("{:width$}", "", width = w)),
+        cursor::MoveTo(0, 0),
+    )?;
+
+    let mut x = 0usize;
+
+    for (i, editor) in editors.iter().enumerate() {
+        let name = editor
+            .filename
+            .as_deref()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(p)
+            })
+            .unwrap_or("New Buffer");
+
+        let modified = editor.modified;
+        // " *name " or "  name "
+        let tab_text = format!(" {}{} ", if modified { "*" } else { " " }, name);
+        let tab_w = tab_text.chars().count();
+
+        // Stop drawing if we've run out of space (leave 1 col margin).
+        if x + tab_w >= w {
+            break;
+        }
+
+        if i == active_tab {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::White),
+                SetForegroundColor(Color::DarkBlue),
+                SetAttribute(Attribute::Bold),
+                style::Print(&tab_text),
+                SetAttribute(Attribute::Reset),
+                SetBackgroundColor(Color::DarkBlue),
+            )?;
+        } else {
+            let fg = if modified { Color::Yellow } else { Color::Grey };
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::DarkBlue),
+                SetForegroundColor(fg),
+                style::Print(&tab_text),
+            )?;
+        }
+        x += tab_w;
+
+        // Separator between tabs.
+        if i + 1 < editors.len() && x + 1 < w {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::DarkBlue),
+                SetForegroundColor(Color::DarkGrey),
+                style::Print("\u{2502}"), // │
+            )?;
+            x += 1;
+        }
+    }
+
+    // Right-align "NanoLike" brand if space allows.
+    let brand = " NanoLike ";
+    if w > x + brand.len() {
+        queue!(
+            stdout,
+            cursor::MoveTo((w - brand.len()) as u16, 0),
+            SetBackgroundColor(Color::DarkBlue),
+            SetForegroundColor(Color::DarkGrey),
+            style::Print(brand),
+        )?;
+    }
+
+    queue!(stdout, ResetColor)
 }
 
 /// Builds the set of (row, byte_offset) pairs that fall inside the current selection.
