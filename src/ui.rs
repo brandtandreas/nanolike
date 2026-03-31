@@ -201,10 +201,13 @@ fn draw_text_area(
 }
 
 fn draw_status_bar(stdout: &mut impl Write, editor: &Editor, h: usize, w: usize) -> io::Result<()> {
+    let bom_tag = if editor.has_bom { " BOM" } else { "" };
     let col_info = format!(
-        " Ln {}, Col {} ",
+        " Ln {}, Col {} | {}{} ",
         editor.cursor_row + 1,
-        editor.cursor_char_col() + 1
+        editor.cursor_char_col() + 1,
+        editor.encoding.name(),
+        bom_tag,
     );
     let msg_width = w.saturating_sub(col_info.len());
 
