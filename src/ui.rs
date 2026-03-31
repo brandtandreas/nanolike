@@ -78,6 +78,32 @@ fn draw_title_bar(stdout: &mut impl Write, editor: &Editor, w: usize) -> io::Res
     )
 }
 
+/// Builds the set of (row, byte_offset) pairs that fall inside the current selection.
+fn build_selection_set(editor: &Editor) -> HashSet<(usize, usize)> {
+    let mut set = HashSet::new();
+    let Some(((sr, sc), (er, ec))) = editor.selection_ordered() else {
+        return set;
+    };
+    for row in sr..=er {
+        if row >= editor.lines.len() {
+            break;
+        }
+        let line = &editor.lines[row];
+        let col_start = if row == sr { sc } else { 0 };
+        let col_end   = if row == er { ec } else { line.len() };
+        let mut byte_pos = col_start;
+        while byte_pos < col_end {
+            set.insert((row, byte_pos));
+            byte_pos += line[byte_pos..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+        }
+    }
+    set
+}
+
 /// Builds the set of (row, byte_offset) pairs that should be highlighted as search matches.
 fn build_search_highlight_set(editor: &Editor) -> HashSet<(usize, usize)> {
     let mut set = HashSet::new();
@@ -110,6 +136,7 @@ fn render_line(
     text_width: usize,
     w: usize,
     search_set: &HashSet<(usize, usize)>,
+    sel_set: &HashSet<(usize, usize)>,
 ) -> io::Result<()> {
     let line = &editor.lines[file_row];
     let visible: Vec<(usize, char)> = line
@@ -120,7 +147,17 @@ fn render_line(
 
     let printed = visible.len();
     for (byte_pos, ch) in &visible {
-        if search_set.contains(&(file_row, *byte_pos)) {
+        let in_sel    = sel_set.contains(&(file_row, *byte_pos));
+        let in_search = search_set.contains(&(file_row, *byte_pos));
+        if in_sel {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::Cyan),
+                SetForegroundColor(Color::Black),
+                style::Print(ch),
+                ResetColor,
+            )?;
+        } else if in_search {
             queue!(
                 stdout,
                 SetBackgroundColor(Color::Yellow),
@@ -158,6 +195,7 @@ fn draw_text_area(
     w: usize,
 ) -> io::Result<()> {
     let search_set = build_search_highlight_set(editor);
+    let sel_set    = build_selection_set(editor);
 
     for screen_row in 0..text_height {
         let file_row = screen_row + editor.scroll_row;
@@ -182,7 +220,7 @@ fn draw_text_area(
         }
 
         if file_row < editor.lines.len() {
-            render_line(stdout, editor, file_row, y, lnw, text_width, w, &search_set)?;
+            render_line(stdout, editor, file_row, y, lnw, text_width, w, &search_set, &sel_set)?;
         } else {
             // Past the end of the file: show a tilde.
             queue!(

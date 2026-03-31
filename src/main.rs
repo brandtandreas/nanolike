@@ -320,14 +320,18 @@ impl App {
             "page_down" => self.editor.move_page_down(self.text_height()),
 
             "file_top" => {
+                self.editor.selection_anchor = None;
                 self.editor.cursor_row = 0;
                 self.editor.cursor_col = 0;
             }
             "file_bottom" => {
+                self.editor.selection_anchor = None;
                 self.editor.cursor_row = self.editor.lines.len().saturating_sub(1);
                 self.editor.cursor_col =
                     self.editor.lines.last().map(|l| l.len()).unwrap_or(0);
             }
+
+            "select_all" => self.editor.select_all(),
 
             "undo" => self.editor.do_undo(),
             "redo" => self.editor.do_redo(),
@@ -376,40 +380,83 @@ impl App {
             return Ok(());
         }
 
-        let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = ev.modifiers.contains(KeyModifiers::ALT);
+        let ctrl  = ev.modifiers.contains(KeyModifiers::CONTROL);
+        let alt   = ev.modifiers.contains(KeyModifiers::ALT);
+        let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
 
-        // ── Unmodified navigation (highest priority, always available) ─────────
+        // ── Navigation (with optional shift-selection) ────────────────────────
+        //
+        // For every nav key:
+        //   • With Shift   → anchor at cursor if not set, then move (extends selection)
+        //   • Without Shift → clear any selection, then move
+        //
+        // Helper closures (macros) are not possible here, so we handle each case
+        // explicitly.  The pattern is always:
+        //   1. if shift { set_anchor_if_none } else { clear_anchor }
+        //   2. call the move method
+        //   3. return Ok(())
+
         match ev.code {
-            KeyCode::Up => {
+            KeyCode::Up if !ctrl && !alt => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
                 self.editor.move_up();
                 return Ok(());
             }
-            KeyCode::Down => {
+            KeyCode::Down if !ctrl && !alt => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
                 self.editor.move_down();
                 return Ok(());
             }
             KeyCode::Left if !ctrl && !alt => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
                 self.editor.move_left();
                 return Ok(());
             }
             KeyCode::Right if !ctrl && !alt => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
                 self.editor.move_right();
                 return Ok(());
             }
+            // Ctrl+Left / Ctrl+Right  (also handles Shift+Ctrl variants)
+            KeyCode::Left if ctrl && !alt => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
+                self.editor.move_prev_word();
+                return Ok(());
+            }
+            KeyCode::Right if ctrl && !alt => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
+                self.editor.move_next_word();
+                return Ok(());
+            }
             KeyCode::Home if !ctrl => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
                 self.editor.move_home();
                 return Ok(());
             }
             KeyCode::End if !ctrl => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
                 self.editor.move_end();
                 return Ok(());
             }
-            KeyCode::PageUp if !ctrl && !alt => {
+            KeyCode::Home if ctrl => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
+                self.editor.cursor_row = 0;
+                self.editor.cursor_col = 0;
+                return Ok(());
+            }
+            KeyCode::End if ctrl => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
+                self.editor.cursor_row = self.editor.lines.len().saturating_sub(1);
+                self.editor.cursor_col = self.editor.lines.last().map(|l| l.len()).unwrap_or(0);
+                return Ok(());
+            }
+            KeyCode::PageUp => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
                 self.editor.move_page_up(self.text_height());
                 return Ok(());
             }
-            KeyCode::PageDown if !ctrl && !alt => {
+            KeyCode::PageDown => {
+                if shift { self.set_anchor_if_none(); } else { self.editor.selection_anchor = None; }
                 self.editor.move_page_down(self.text_height());
                 return Ok(());
             }
@@ -433,6 +480,11 @@ impl App {
                 }
                 return Ok(());
             }
+            KeyCode::Esc => {
+                // Clear selection on Escape (fall through to keybinding lookup
+                // so a bound "escape" action still fires, but clear first).
+                self.editor.selection_anchor = None;
+            }
             _ => {}
         }
 
@@ -450,6 +502,15 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Set `selection_anchor` to the current cursor position, but only if no
+    /// anchor is already set (so extending an existing selection doesn't reset it).
+    fn set_anchor_if_none(&mut self) {
+        if self.editor.selection_anchor.is_none() {
+            self.editor.selection_anchor =
+                Some((self.editor.cursor_row, self.editor.cursor_col));
+        }
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────

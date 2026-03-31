@@ -73,7 +73,8 @@ pub struct Editor {
     pub modified: bool,
     pub status_msg: String,
     pub status_error: bool,
-    pub clipboard: Vec<String>,
+    pub clipboard: String,
+    pub selection_anchor: Option<(usize, usize)>,
     pub undo_stack: UndoStack,
     pub saved_lines: Vec<String>,
     pub search_term: String,
@@ -98,7 +99,8 @@ impl Editor {
             modified: false,
             status_msg: String::new(),
             status_error: false,
-            clipboard: Vec::new(),
+            clipboard: String::new(),
+            selection_anchor: None,
             undo_stack: UndoStack::new(),
             saved_lines: vec![String::new()],
             search_term: String::new(),
@@ -234,9 +236,81 @@ impl Editor {
             .count()
     }
 
+    // ── Selection ────────────────────────────────────────────────────────────
+
+    pub fn has_selection(&self) -> bool {
+        match self.selection_anchor {
+            Some((ar, ac)) => (ar, ac) != (self.cursor_row, self.cursor_col),
+            None => false,
+        }
+    }
+
+    /// Returns `Some((start, end))` in document order if a non-empty selection
+    /// exists, where each end is `(row, byte_col)`.
+    pub fn selection_ordered(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (ar, ac) = self.selection_anchor?;
+        let (cr, cc) = (self.cursor_row, self.cursor_col);
+        if (ar, ac) == (cr, cc) {
+            return None;
+        }
+        if (ar, ac) <= (cr, cc) {
+            Some(((ar, ac), (cr, cc)))
+        } else {
+            Some(((cr, cc), (ar, ac)))
+        }
+    }
+
+    pub fn get_selected_text(&self) -> String {
+        let Some(((sr, sc), (er, ec))) = self.selection_ordered() else {
+            return String::new();
+        };
+        if sr == er {
+            return self.lines[sr][sc..ec].to_string();
+        }
+        let mut out = self.lines[sr][sc..].to_string();
+        for row in sr + 1..er {
+            out.push('\n');
+            out.push_str(&self.lines[row]);
+        }
+        out.push('\n');
+        out.push_str(&self.lines[er][..ec]);
+        out
+    }
+
+    /// Delete the selected region, move cursor to the selection start, and
+    /// clear the anchor. Saves an undo snapshot before modifying.
+    pub fn delete_selection(&mut self) {
+        let Some(((sr, sc), (er, ec))) = self.selection_ordered() else {
+            return;
+        };
+        self.save_undo();
+        if sr == er {
+            self.lines[sr].drain(sc..ec);
+        } else {
+            let end_tail = self.lines[er][ec..].to_string();
+            self.lines[sr].truncate(sc);
+            self.lines[sr].push_str(&end_tail);
+            self.lines.drain(sr + 1..=er);
+        }
+        self.cursor_row = sr;
+        self.cursor_col = sc;
+        self.selection_anchor = None;
+        self.modified = true;
+    }
+
+    pub fn select_all(&mut self) {
+        self.selection_anchor = Some((0, 0));
+        self.cursor_row = self.lines.len() - 1;
+        self.cursor_col = self.lines.last().map(|l| l.len()).unwrap_or(0);
+        self.set_status("All selected", false);
+    }
+
     // ── Editing ──────────────────────────────────────────────────────────────
 
     pub fn insert_char(&mut self, ch: char) {
+        if self.has_selection() {
+            self.delete_selection();
+        }
         self.save_undo();
         let col = self.cursor_col;
         self.lines[self.cursor_row].insert(col, ch);
@@ -245,6 +319,9 @@ impl Editor {
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        if self.has_selection() {
+            self.delete_selection();
+        }
         self.save_undo();
         let col = self.cursor_col;
         self.lines[self.cursor_row].insert_str(col, s);
@@ -253,6 +330,9 @@ impl Editor {
     }
 
     pub fn insert_newline(&mut self, auto_indent: bool) {
+        if self.has_selection() {
+            self.delete_selection();
+        }
         self.save_undo();
         let col = self.cursor_col;
         let after = self.lines[self.cursor_row].split_off(col);
@@ -272,6 +352,10 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        if self.has_selection() {
+            self.delete_selection();
+            return;
+        }
         if self.cursor_col > 0 {
             self.save_undo();
             let col = self.cursor_col;
@@ -295,6 +379,10 @@ impl Editor {
     }
 
     pub fn delete_char(&mut self) {
+        if self.has_selection() {
+            self.delete_selection();
+            return;
+        }
         let line_len = self.lines[self.cursor_row].len();
         if self.cursor_col < line_len {
             self.save_undo();
@@ -315,8 +403,15 @@ impl Editor {
     }
 
     pub fn cut_line(&mut self) {
+        if self.has_selection() {
+            self.clipboard = self.get_selected_text();
+            self.delete_selection();
+            self.set_status("Selection cut", false);
+            return;
+        }
         self.save_undo();
-        self.clipboard = vec![self.lines.remove(self.cursor_row)];
+        let line = self.lines.remove(self.cursor_row);
+        self.clipboard = line + "\n";
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -326,7 +421,13 @@ impl Editor {
     }
 
     pub fn copy_line(&mut self) {
-        self.clipboard = vec![self.lines[self.cursor_row].clone()];
+        if self.has_selection() {
+            self.clipboard = self.get_selected_text();
+            self.selection_anchor = None;
+            self.set_status("Selection copied", false);
+            return;
+        }
+        self.clipboard = self.lines[self.cursor_row].clone() + "\n";
         self.set_status("Line copied", false);
     }
 
@@ -335,15 +436,36 @@ impl Editor {
             self.set_status("Clipboard empty", false);
             return;
         }
-        self.save_undo();
-        let clips = self.clipboard.clone();
-        let count = clips.len();
-        for (i, line) in clips.into_iter().enumerate() {
-            self.lines.insert(self.cursor_row + i + 1, line);
+        if self.has_selection() {
+            self.delete_selection();
         }
-        self.cursor_row += count;
+        self.save_undo();
+        let text = self.clipboard.clone();
+        let parts: Vec<&str> = text.split('\n').collect();
+        if parts.len() == 1 {
+            // Inline paste (no newline in clipboard)
+            let col = self.cursor_col;
+            self.lines[self.cursor_row].insert_str(col, parts[0]);
+            self.cursor_col += parts[0].len();
+        } else {
+            // Multi-line paste
+            let col = self.cursor_col;
+            let tail = self.lines[self.cursor_row][col..].to_string();
+            self.lines[self.cursor_row].truncate(col);
+            self.lines[self.cursor_row].push_str(parts[0]);
+            let insert_row = self.cursor_row + 1;
+            for (i, &chunk) in parts[1..].iter().enumerate() {
+                self.lines.insert(insert_row + i, chunk.to_string());
+            }
+            // Append the original tail to the last inserted line
+            let last_row = insert_row + parts.len() - 2;
+            let last_chunk_len = parts.last().map(|s| s.len()).unwrap_or(0);
+            self.lines[last_row].push_str(&tail);
+            self.cursor_row = last_row;
+            self.cursor_col = last_chunk_len;
+        }
         self.modified = true;
-        self.set_status(format!("Pasted {} line(s)", count), false);
+        self.set_status("Pasted", false);
     }
 
     pub fn delete_word_before(&mut self) {
