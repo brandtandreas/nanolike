@@ -72,7 +72,7 @@ pub fn default_keybindings() -> HashMap<String, Vec<String>> {
         ("paste",                &["ctrl+u", "ctrl+v"]),
         ("copy_line",            &["alt+c", "ctrl+c"]),
         ("select_all",           &["ctrl+a"]),
-        ("search",               &["ctrl+f", "ctrl+w"]),
+        ("search",               &["ctrl+f"]),
         ("search_next",          &["f3"]),
         ("search_prev",          &["ctrl+p"]),
         ("replace",              &["ctrl+r", "ctrl+h"]),
