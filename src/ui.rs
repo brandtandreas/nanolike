@@ -306,8 +306,22 @@ fn draw_help_bar(stdout: &mut impl Write, kb: &KeyBindings, h: usize, w: usize) 
         ("redo",      "Redo"),
         ("help",      "Help"),
     ];
-    draw_help_row(stdout, row1, kb, (h - 2) as u16, w)?;
-    draw_help_row(stdout, row2, kb, (h - 1) as u16, w)
+
+    // Compute per-column widths so both rows align.
+    let ncols = row1.len().max(row2.len());
+    let entry_width = |action: &str, label: &str| {
+        kb.first_key(action).chars().count() + 1 + label.chars().count()
+    };
+    let col_widths: Vec<usize> = (0..ncols)
+        .map(|i| {
+            let w1 = row1.get(i).map(|(a, l)| entry_width(a, l)).unwrap_or(0);
+            let w2 = row2.get(i).map(|(a, l)| entry_width(a, l)).unwrap_or(0);
+            w1.max(w2)
+        })
+        .collect();
+
+    draw_help_row(stdout, row1, kb, (h - 2) as u16, w, &col_widths)?;
+    draw_help_row(stdout, row2, kb, (h - 1) as u16, w, &col_widths)
 }
 
 fn draw_help_row(
@@ -316,8 +330,10 @@ fn draw_help_row(
     kb: &KeyBindings,
     y: u16,
     w: usize,
+    col_widths: &[usize],
 ) -> io::Result<()> {
     const BG: Color = Color::DarkBlue;
+    const SEP: &str = "  \u{2502}  "; // "  │  "
 
     // Fill the row with the background colour.
     queue!(
@@ -331,13 +347,15 @@ fn draw_help_row(
     let mut x = 0usize;
     let mut first = true;
 
-    for (action, label) in shortcuts {
+    for (i, (action, label)) in shortcuts.iter().enumerate() {
         let key = kb.first_key(action);
+        let col_w = col_widths.get(i).copied().unwrap_or(0);
+        let entry_w = key.chars().count() + 1 + label.chars().count();
+        let pad = col_w.saturating_sub(entry_w);
 
         // Separator between entries.
-        let sep = if first { " " } else { "  \u{2502}  " }; // "  │  "
-        let entry_chars = sep.chars().count() + key.chars().count() + 1 + label.chars().count();
-        if x + entry_chars >= w {
+        let sep = if first { " " } else { SEP };
+        if x + sep.chars().count() + col_w >= w {
             break;
         }
 
@@ -370,6 +388,16 @@ fn draw_help_row(
             style::Print(format!(" {}", label)),
         )?;
         x += 1 + label.chars().count();
+
+        // Trailing padding so this column occupies exactly col_w chars.
+        if pad > 0 {
+            queue!(
+                stdout,
+                SetBackgroundColor(BG),
+                style::Print(" ".repeat(pad)),
+            )?;
+            x += pad;
+        }
     }
 
     queue!(stdout, ResetColor)
