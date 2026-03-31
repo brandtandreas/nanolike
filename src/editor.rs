@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use encoding_rs::Encoding;
+
 const MAX_UNDO: usize = 200;
 
 #[derive(Clone)]
@@ -78,6 +80,10 @@ pub struct Editor {
     /// (row, byte_col) of each match start.
     pub search_matches: Vec<(usize, usize)>,
     pub search_idx: usize,
+    /// The encoding detected when the file was opened (default UTF-8 for new files).
+    pub encoding: &'static Encoding,
+    /// Whether the file had a byte-order mark (BOM); preserved on save.
+    pub has_bom: bool,
 }
 
 impl Editor {
@@ -98,6 +104,8 @@ impl Editor {
             search_term: String::new(),
             search_matches: Vec::new(),
             search_idx: 0,
+            encoding: encoding_rs::UTF_8,
+            has_bom: false,
         };
         if let Some(ref fname) = filename {
             if std::path::Path::new(fname).exists() {
@@ -112,13 +120,43 @@ impl Editor {
     }
 
     fn load_file(&mut self, path: &str) {
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                self.lines = content.lines().map(|l| l.to_string()).collect();
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                // BOM detection has priority; fall back to statistical detection.
+                let (encoding, bom_len) =
+                    if let Some((enc, bom_len)) = Encoding::for_bom(&bytes) {
+                        (enc, bom_len)
+                    } else {
+                        let mut detector = chardetng::EncodingDetector::new();
+                        detector.feed(&bytes, true);
+                        (detector.guess(None, true), 0)
+                    };
+
+                self.encoding = encoding;
+                self.has_bom = bom_len > 0;
+
+                let (cow, _, had_errors) = encoding.decode(&bytes[bom_len..]);
+                self.lines = cow.lines().map(|l| l.to_string()).collect();
                 if self.lines.is_empty() {
                     self.lines.push(String::new());
                 }
-                self.status_msg = format!("Read {} lines", self.lines.len());
+
+                let enc_name = encoding.name();
+                if had_errors {
+                    self.set_status(
+                        format!(
+                            "Read {} lines [{}] (encoding errors; some chars replaced)",
+                            self.lines.len(),
+                            enc_name
+                        ),
+                        true,
+                    );
+                } else {
+                    self.set_status(
+                        format!("Read {} lines [{}]", self.lines.len(), enc_name),
+                        false,
+                    );
+                }
             }
             Err(e) => {
                 self.set_status(format!("Error: {}", e), true);
@@ -449,12 +487,16 @@ impl Editor {
 
     pub fn save_file(&mut self, path: &str) -> bool {
         let content = self.lines.join("\n") + "\n";
-        match std::fs::write(path, content) {
+        let bytes = self.encode_content(&content);
+        match std::fs::write(path, bytes) {
             Ok(_) => {
                 self.filename = Some(path.to_string());
                 self.modified = false;
                 self.saved_lines = self.lines.clone();
-                self.set_status(format!("Saved: {}", path), false);
+                self.set_status(
+                    format!("Saved: {} [{}]", path, self.encoding.name()),
+                    false,
+                );
                 true
             }
             Err(e) => {
@@ -462,6 +504,41 @@ impl Editor {
                 false
             }
         }
+    }
+
+    /// Encode `content` (internal UTF-8) back to the file's original encoding.
+    /// UTF-16 LE/BE are handled manually since encoding_rs only decodes them.
+    fn encode_content(&self, content: &str) -> Vec<u8> {
+        if self.encoding == encoding_rs::UTF_16LE {
+            let mut bytes = if self.has_bom { vec![0xFF_u8, 0xFE] } else { Vec::new() };
+            for unit in content.encode_utf16() {
+                bytes.push(unit as u8);
+                bytes.push((unit >> 8) as u8);
+            }
+            return bytes;
+        }
+        if self.encoding == encoding_rs::UTF_16BE {
+            let mut bytes = if self.has_bom { vec![0xFE_u8, 0xFF] } else { Vec::new() };
+            for unit in content.encode_utf16() {
+                bytes.push((unit >> 8) as u8);
+                bytes.push(unit as u8);
+            }
+            return bytes;
+        }
+
+        // All other encodings (UTF-8, Latin-1, Windows-125x, GBK, …)
+        let (cow, _, _) = self.encoding.encode(content);
+        let encoded = cow.into_owned();
+
+        // Re-prepend a UTF-8 BOM if the original file had one.
+        if self.has_bom && self.encoding == encoding_rs::UTF_8 {
+            let mut result = Vec::with_capacity(3 + encoded.len());
+            result.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            result.extend_from_slice(&encoded);
+            return result;
+        }
+
+        encoded
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -472,21 +549,10 @@ impl Editor {
             return;
         }
         let term_lower = self.search_term.to_lowercase();
-        let term_len = term_lower.len();
         for (row, line) in self.lines.iter().enumerate() {
             let line_lower = line.to_lowercase();
-            let mut start = 0usize;
-            while start + term_len <= line_lower.len() {
-                if line_lower[start..].starts_with(&term_lower) {
-                    self.search_matches.push((row, start));
-                    start += term_len;
-                } else {
-                    start += line_lower[start..]
-                        .chars()
-                        .next()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(1);
-                }
+            for col in find_matches_in_line(&line_lower, &term_lower) {
+                self.search_matches.push((row, col));
             }
         }
     }
@@ -598,6 +664,23 @@ impl Editor {
             self.scroll_col = char_col + 1 - text_width;
         }
     }
+}
+
+/// Returns the byte offsets of all non-overlapping occurrences of `term_lower`
+/// in `line_lower`. Both arguments must already be lowercase.
+fn find_matches_in_line(line_lower: &str, term_lower: &str) -> Vec<usize> {
+    let term_len = term_lower.len();
+    let mut matches = Vec::new();
+    let mut start = 0usize;
+    while start + term_len <= line_lower.len() {
+        if line_lower[start..].starts_with(term_lower) {
+            matches.push(start);
+            start += term_len;
+        } else {
+            start += line_lower[start..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+    }
+    matches
 }
 
 /// Convert a char index to a byte offset in `s`, clamped to `s.len()`.

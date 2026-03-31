@@ -78,6 +78,77 @@ fn draw_title_bar(stdout: &mut impl Write, editor: &Editor, w: usize) -> io::Res
     )
 }
 
+/// Builds the set of (row, byte_offset) pairs that should be highlighted as search matches.
+fn build_search_highlight_set(editor: &Editor) -> HashSet<(usize, usize)> {
+    let mut set = HashSet::new();
+    if editor.search_term.is_empty() {
+        return set;
+    }
+    for &(row, start_col) in &editor.search_matches {
+        if row >= editor.lines.len() {
+            continue;
+        }
+        let line = &editor.lines[row];
+        let mut byte_pos = start_col;
+        for _ in editor.search_term.chars() {
+            set.insert((row, byte_pos));
+            match line[byte_pos..].chars().next() {
+                Some(c) => byte_pos += c.len_utf8(),
+                None => break,
+            }
+        }
+    }
+    set
+}
+
+fn render_line(
+    stdout: &mut impl Write,
+    editor: &Editor,
+    file_row: usize,
+    y: u16,
+    lnw: usize,
+    text_width: usize,
+    w: usize,
+    search_set: &HashSet<(usize, usize)>,
+) -> io::Result<()> {
+    let line = &editor.lines[file_row];
+    let visible: Vec<(usize, char)> = line
+        .char_indices()
+        .skip(editor.scroll_col)
+        .take(text_width)
+        .collect();
+
+    let printed = visible.len();
+    for (byte_pos, ch) in &visible {
+        if search_set.contains(&(file_row, *byte_pos)) {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::Yellow),
+                SetForegroundColor(Color::Black),
+                SetAttribute(Attribute::Bold),
+                style::Print(ch),
+                ResetColor,
+            )?;
+        } else {
+            queue!(stdout, style::Print(ch))?;
+        }
+    }
+
+    // Pad the rest of the text area on this row.
+    if printed < text_width {
+        let pad_end = (lnw + text_width).min(w);
+        let current_x = (lnw + printed) as u16;
+        if (pad_end as u16) > current_x {
+            queue!(
+                stdout,
+                cursor::MoveTo(current_x, y),
+                style::Print(" ".repeat(pad_end - lnw - printed)),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn draw_text_area(
     stdout: &mut impl Write,
     editor: &Editor,
@@ -86,24 +157,7 @@ fn draw_text_area(
     lnw: usize,
     w: usize,
 ) -> io::Result<()> {
-    // Build set of (row, byte_offset) pairs that should be highlighted.
-    let mut search_set: HashSet<(usize, usize)> = HashSet::new();
-    if !editor.search_term.is_empty() {
-        for &(row, start_col) in &editor.search_matches {
-            if row < editor.lines.len() {
-                let line = &editor.lines[row];
-                let mut byte_pos = start_col;
-                for _ in editor.search_term.chars() {
-                    search_set.insert((row, byte_pos));
-                    if let Some(c) = line[byte_pos..].chars().next() {
-                        byte_pos += c.len_utf8();
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    let search_set = build_search_highlight_set(editor);
 
     for screen_row in 0..text_height {
         let file_row = screen_row + editor.scroll_row;
@@ -128,42 +182,7 @@ fn draw_text_area(
         }
 
         if file_row < editor.lines.len() {
-            let line = &editor.lines[file_row];
-            // Chars visible in the horizontal scroll window.
-            let visible: Vec<(usize, char)> = line
-                .char_indices()
-                .skip(editor.scroll_col)
-                .take(text_width)
-                .collect();
-
-            let printed = visible.len();
-            for (byte_pos, ch) in &visible {
-                if search_set.contains(&(file_row, *byte_pos)) {
-                    queue!(
-                        stdout,
-                        SetBackgroundColor(Color::Yellow),
-                        SetForegroundColor(Color::Black),
-                        SetAttribute(Attribute::Bold),
-                        style::Print(ch),
-                        ResetColor,
-                    )?;
-                } else {
-                    queue!(stdout, style::Print(ch))?;
-                }
-            }
-
-            // Pad the rest of the text area on this row.
-            if printed < text_width {
-                let pad_end = (lnw + text_width).min(w);
-                let current_x = (lnw + printed) as u16;
-                if (pad_end as u16) > current_x {
-                    queue!(
-                        stdout,
-                        cursor::MoveTo(current_x, y),
-                        style::Print(" ".repeat(pad_end - lnw - printed)),
-                    )?;
-                }
-            }
+            render_line(stdout, editor, file_row, y, lnw, text_width, w, &search_set)?;
         } else {
             // Past the end of the file: show a tilde.
             queue!(
@@ -182,10 +201,13 @@ fn draw_text_area(
 }
 
 fn draw_status_bar(stdout: &mut impl Write, editor: &Editor, h: usize, w: usize) -> io::Result<()> {
+    let bom_tag = if editor.has_bom { " BOM" } else { "" };
     let col_info = format!(
-        " Ln {}, Col {} ",
+        " Ln {}, Col {} | {}{} ",
         editor.cursor_row + 1,
-        editor.cursor_char_col() + 1
+        editor.cursor_char_col() + 1,
+        editor.encoding.name(),
+        bom_tag,
     );
     let msg_width = w.saturating_sub(col_info.len());
 
@@ -292,18 +314,16 @@ pub fn prompt(
         )?;
         stdout.flush()?;
 
-        match event::read()? {
-            Event::Key(key) => match key.code {
-                KeyCode::Enter => return Ok(Some(buf)),
-                KeyCode::Esc => return Ok(None),
-                KeyCode::Backspace => {
-                    buf.pop();
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    buf.push(c);
-                }
-                _ => {}
-            },
+        let Event::Key(key) = event::read()? else { continue };
+        match key.code {
+            KeyCode::Enter => return Ok(Some(buf)),
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                buf.push(c);
+            }
             _ => {}
         }
     }
