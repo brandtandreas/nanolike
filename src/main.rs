@@ -196,9 +196,15 @@ impl App {
     }
 
     fn handle_open_file(&mut self) -> io::Result<()> {
-        let fname = match self.prompt_non_empty("Open file: ", "")? {
-            Some(f) => f,
-            None => return Ok(()),
+        let fname = match ui::file_prompt(
+            &mut self.stdout,
+            "Open file: ",
+            "",
+            self.term_h,
+            self.term_w,
+        )? {
+            Some(f) if !f.is_empty() => f,
+            _ => return Ok(()),
         };
         // If the current tab is a pristine empty buffer, reuse it.
         let current_is_empty = {

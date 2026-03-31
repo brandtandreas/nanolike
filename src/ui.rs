@@ -477,6 +477,160 @@ fn draw_help_row(
     queue!(stdout, ResetColor)
 }
 
+// ── File-path completion ──────────────────────────────────────────────────────
+
+const COMPLETE_MAX: usize = 8;
+
+/// Expand a leading `~` using the `HOME` environment variable.
+fn expand_tilde(s: &str) -> String {
+    if s == "~" || s.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return s.replacen('~', &home, 1);
+        }
+    }
+    s.to_string()
+}
+
+/// Return sorted filesystem completions for a partial path string.
+fn get_path_completions(partial: &str) -> Vec<String> {
+    // Split the input into the directory to scan and the filename prefix.
+    let (scan_dir, name_prefix, out_prefix) = if partial.is_empty() {
+        (".".to_string(), String::new(), String::new())
+    } else if partial.ends_with('/') {
+        // "src/" → scan "src", prefix every result with "src/"
+        let dir = partial.trim_end_matches('/');
+        let dir = if dir.is_empty() { "/" } else { dir };
+        (dir.to_string(), String::new(), partial.to_string())
+    } else {
+        let p = std::path::Path::new(partial);
+        let parent = p.parent().unwrap_or(std::path::Path::new(""));
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let (scan, pfx) = if parent == std::path::Path::new("") {
+            (".".to_string(), String::new())
+        } else {
+            (
+                parent.to_string_lossy().to_string(),
+                format!("{}/", parent.display()),
+            )
+        };
+        (scan, name, pfx)
+    };
+
+    let scan_expanded = expand_tilde(&scan_dir);
+    let Ok(entries) = std::fs::read_dir(&scan_expanded) else {
+        return vec![];
+    };
+
+    let mut results: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let fname = e.file_name();
+            let fname_str = fname.to_string_lossy();
+            if fname_str.starts_with(&name_prefix as &str) {
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let mut r = format!("{}{}", out_prefix, fname_str);
+                if is_dir {
+                    r.push('/');
+                }
+                Some(r)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    results.sort();
+    results
+}
+
+/// Longest string that is a prefix of every element in `strs`.
+fn common_prefix(strs: &[String]) -> String {
+    if strs.is_empty() {
+        return String::new();
+    }
+    let mut prefix = strs[0].clone();
+    for s in &strs[1..] {
+        let len: usize = prefix
+            .chars()
+            .zip(s.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum();
+        prefix.truncate(len);
+    }
+    prefix
+}
+
+/// How many screen rows the popup for `n` completions occupies
+/// (includes the counter line when n > COMPLETE_MAX).
+fn popup_rows(n: usize) -> usize {
+    let shown = n.min(COMPLETE_MAX);
+    if n > COMPLETE_MAX { shown + 1 } else { shown }
+}
+
+/// Draw the completion popup above `prompt_row`.
+/// Returns the number of rows drawn.
+fn draw_completion_popup(
+    stdout: &mut impl Write,
+    completions: &[String],
+    selected: isize, // -1 = none, 0.. = index
+    prompt_row: usize,
+    w: usize,
+) -> io::Result<usize> {
+    let n = completions.len();
+    if n == 0 {
+        return Ok(0);
+    }
+    let shown = n.min(COMPLETE_MAX);
+    let has_counter = n > COMPLETE_MAX;
+    let total = popup_rows(n);
+
+    // Scroll window: keep `selected` visible.
+    let offset = if selected >= 0 {
+        let s = selected as usize;
+        s.saturating_sub(shown - 1).min(n.saturating_sub(shown))
+    } else {
+        0
+    };
+
+    // Draw entries (top of popup first).
+    for i in 0..shown {
+        let item_idx = offset + i;
+        let row = (prompt_row as isize - total as isize + i as isize).max(1) as u16;
+        let is_sel = selected == item_idx as isize;
+        let label = format!(" {} ", &completions[item_idx]);
+        let padded = format!("{:<width$}", truncate_chars(&label, w), width = w);
+        queue!(
+            stdout,
+            cursor::MoveTo(0, row),
+            SetBackgroundColor(if is_sel { Color::Blue } else { Color::DarkGrey }),
+            SetForegroundColor(Color::White),
+            style::Print(&padded),
+            ResetColor,
+        )?;
+    }
+
+    // Counter line at the bottom of the popup when there are hidden items.
+    if has_counter {
+        let row = (prompt_row as isize - 1).max(1) as u16;
+        let msg = format!("  {}/{} matches", offset + shown, n);
+        let padded = format!("{:<width$}", truncate_chars(&msg, w), width = w);
+        queue!(
+            stdout,
+            cursor::MoveTo(0, row),
+            SetBackgroundColor(Color::DarkGrey),
+            SetForegroundColor(Color::DarkCyan),
+            style::Print(&padded),
+            ResetColor,
+        )?;
+    }
+
+    Ok(total)
+}
+
 // ── Interactive prompt ────────────────────────────────────────────────────────
 
 /// Show a prompt on the status row and collect a line of input.
@@ -516,6 +670,148 @@ pub fn prompt(
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 buf.push(c);
             }
+            _ => {}
+        }
+    }
+}
+
+/// File-path prompt with Tab completion.
+///
+/// - **Tab** completes the longest common prefix; a second Tab opens the popup
+///   and cycles forward through matches.
+/// - **Shift+Tab** cycles backward.
+/// - Typing any character resets the completion state.
+pub fn file_prompt(
+    stdout: &mut impl Write,
+    msg: &str,
+    default: &str,
+    h: usize,
+    w: usize,
+) -> io::Result<Option<String>> {
+    let mut buf = default.to_string();
+    let mut completions: Vec<String> = vec![];
+    let mut lcp = String::new();
+    let mut cycle: isize = -1; // -1 = at lcp, 0..= = specific index
+    let mut show_popup = false;
+    let mut prev_popup_rows = 0usize;
+    let prompt_row = h - 3;
+
+    loop {
+        // ── Clear the popup area from the previous frame ───────────────────
+        let cur_rows = if show_popup && !completions.is_empty() {
+            popup_rows(completions.len())
+        } else {
+            0
+        };
+        let clear_rows = prev_popup_rows.max(cur_rows);
+        for i in 0..clear_rows {
+            let row = (prompt_row as isize - clear_rows as isize + i as isize).max(1) as u16;
+            queue!(
+                stdout,
+                cursor::MoveTo(0, row),
+                ResetColor,
+                style::Print(" ".repeat(w)),
+            )?;
+        }
+
+        // ── Draw prompt row ────────────────────────────────────────────────
+        let display = format!("{}{}", msg, buf);
+        let padded = format!("{:<width$}", display, width = w);
+        let cursor_x = (msg.chars().count() + buf.chars().count()).min(w.saturating_sub(1));
+        queue!(
+            stdout,
+            cursor::MoveTo(0, prompt_row as u16),
+            SetBackgroundColor(Color::White),
+            SetForegroundColor(Color::Black),
+            SetAttribute(Attribute::Bold),
+            style::Print(truncate_chars(&padded, w)),
+            ResetColor,
+            cursor::MoveTo(cursor_x as u16, prompt_row as u16),
+            cursor::Show,
+        )?;
+
+        // ── Draw completion popup ──────────────────────────────────────────
+        prev_popup_rows = if show_popup && !completions.is_empty() {
+            draw_completion_popup(stdout, &completions, cycle, prompt_row, w)?
+        } else {
+            0
+        };
+
+        stdout.flush()?;
+
+        // ── Handle input ───────────────────────────────────────────────────
+        let Event::Key(key) = event::read()? else { continue };
+        if key.kind == event::KeyEventKind::Release {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Enter => return Ok(Some(buf)),
+            KeyCode::Esc   => return Ok(None),
+
+            KeyCode::Tab => {
+                if completions.is_empty() {
+                    // First Tab: compute completions.
+                    completions = get_path_completions(&buf);
+                    if completions.is_empty() {
+                        // no matches — nothing to do
+                    } else if completions.len() == 1 {
+                        buf = completions.remove(0);
+                        completions.clear();
+                    } else {
+                        lcp = common_prefix(&completions);
+                        if lcp.len() > buf.len() {
+                            // Advance to LCP but don't show popup yet.
+                            buf = lcp.clone();
+                        } else {
+                            // Already at LCP — show popup immediately.
+                            show_popup = true;
+                            cycle = -1;
+                        }
+                    }
+                } else {
+                    // Subsequent Tab: cycle forward through matches.
+                    show_popup = true;
+                    cycle += 1;
+                    if cycle >= completions.len() as isize {
+                        cycle = -1;
+                        buf = lcp.clone();
+                    } else {
+                        buf = completions[cycle as usize].clone();
+                    }
+                }
+            }
+
+            // Shift+Tab: cycle backward.
+            KeyCode::BackTab => {
+                if !completions.is_empty() {
+                    show_popup = true;
+                    cycle -= 1;
+                    if cycle < -1 {
+                        cycle = completions.len() as isize - 1;
+                    }
+                    buf = if cycle < 0 {
+                        lcp.clone()
+                    } else {
+                        completions[cycle as usize].clone()
+                    };
+                }
+            }
+
+            KeyCode::Backspace => {
+                buf.pop();
+                completions.clear();
+                show_popup = false;
+                cycle = -1;
+            }
+
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                buf.push(c);
+                completions.clear();
+                show_popup = false;
+                cycle = -1;
+            }
+
             _ => {}
         }
     }
