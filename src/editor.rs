@@ -812,3 +812,801 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
         .map(|(b, _)| b)
         .unwrap_or(s.len())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// Build an Editor whose content is `text` (lines separated by `\n`).
+    /// Cursor starts at (0, 0).
+    fn make_editor(text: &str) -> Editor {
+        let mut ed = Editor::new(None);
+        ed.lines = text.lines().map(|l| l.to_string()).collect();
+        if ed.lines.is_empty() {
+            ed.lines.push(String::new());
+        }
+        ed.saved_lines = ed.lines.clone();
+        ed.modified = false;
+        ed
+    }
+
+    // ── find_matches_in_line ─────────────────────────────────────────────────
+    // Note: find_matches_in_line is never called with an empty term in practice
+    // (build_search_matches guards against it); no empty-term test here.
+
+    #[test]
+    fn fml_no_match() {
+        assert_eq!(find_matches_in_line("hello world", "xyz"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn fml_single_match_at_start() {
+        assert_eq!(find_matches_in_line("hello world", "hello"), vec![0]);
+    }
+
+    #[test]
+    fn fml_single_match_at_end() {
+        assert_eq!(find_matches_in_line("say hello", "hello"), vec![4]);
+    }
+
+    #[test]
+    fn fml_multiple_matches() {
+        assert_eq!(find_matches_in_line("aaa", "a"), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn fml_non_overlapping() {
+        // "aa" in "aaaa" should give offsets 0 and 2 (not 0, 1, 2)
+        assert_eq!(find_matches_in_line("aaaa", "aa"), vec![0, 2]);
+    }
+
+    #[test]
+    fn fml_multibyte_chars() {
+        // "é" is 2 bytes; "héllo" has 'h'=0, 'é'=1..3, 'l'=3, 'l'=4, 'o'=5
+        let line = "héllo héllo";
+        let term = "héllo";
+        let matches = find_matches_in_line(line, term);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0], 0);
+    }
+
+    // ── char_to_byte ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn ctb_ascii_positions() {
+        assert_eq!(char_to_byte("hello", 0), 0);
+        assert_eq!(char_to_byte("hello", 2), 2);
+        assert_eq!(char_to_byte("hello", 4), 4);
+    }
+
+    #[test]
+    fn ctb_multibyte() {
+        // "héllo": h=0, é=1 (2 bytes), l=3, l=4, o=5
+        assert_eq!(char_to_byte("héllo", 0), 0);
+        assert_eq!(char_to_byte("héllo", 1), 1); // start of 'é'
+        assert_eq!(char_to_byte("héllo", 2), 3); // 'l' after 'é'
+    }
+
+    #[test]
+    fn ctb_beyond_length_clamped() {
+        assert_eq!(char_to_byte("hi", 100), 2);
+    }
+
+    #[test]
+    fn ctb_empty_string() {
+        assert_eq!(char_to_byte("", 0), 0);
+        assert_eq!(char_to_byte("", 5), 0);
+    }
+
+    // ── UndoStack ────────────────────────────────────────────────────────────
+
+    fn snap(lines: Vec<&str>, row: usize, col: usize) -> Snapshot {
+        Snapshot {
+            lines: lines.into_iter().map(|s| s.to_string()).collect(),
+            cursor_row: row,
+            cursor_col: col,
+        }
+    }
+
+    #[test]
+    fn undostack_new_is_empty() {
+        let us = UndoStack::new();
+        assert!(!us._can_undo());
+        assert!(!us._can_redo());
+    }
+
+    #[test]
+    fn undostack_push_enables_undo() {
+        let mut us = UndoStack::new();
+        us.push_edit(snap(vec!["hello"], 0, 0));
+        assert!(us._can_undo());
+        assert!(!us._can_redo());
+    }
+
+    #[test]
+    fn undostack_do_undo_returns_snapshot() {
+        let mut us = UndoStack::new();
+        let s = snap(vec!["original"], 0, 0);
+        us.push_edit(s.clone());
+        let restored = us.do_undo(snap(vec!["changed"], 0, 0)).unwrap();
+        assert_eq!(restored.lines, vec!["original"]);
+        assert!(us._can_redo());
+        assert!(!us._can_undo());
+    }
+
+    #[test]
+    fn undostack_do_redo_returns_snapshot() {
+        let mut us = UndoStack::new();
+        us.push_edit(snap(vec!["original"], 0, 0));
+        let current = snap(vec!["changed"], 0, 0);
+        let _prev = us.do_undo(current).unwrap();
+        let redone = us.do_redo(snap(vec!["original"], 0, 0)).unwrap();
+        assert_eq!(redone.lines, vec!["changed"]);
+    }
+
+    #[test]
+    fn undostack_undo_empty_returns_none() {
+        let mut us = UndoStack::new();
+        assert!(us.do_undo(snap(vec!["x"], 0, 0)).is_none());
+    }
+
+    #[test]
+    fn undostack_redo_empty_returns_none() {
+        let mut us = UndoStack::new();
+        assert!(us.do_redo(snap(vec!["x"], 0, 0)).is_none());
+    }
+
+    #[test]
+    fn undostack_push_clears_redo() {
+        let mut us = UndoStack::new();
+        us.push_edit(snap(vec!["a"], 0, 0));
+        us.do_undo(snap(vec!["b"], 0, 0)).unwrap();
+        assert!(us._can_redo());
+        // Push a new edit — redo should be cleared
+        us.push_edit(snap(vec!["c"], 0, 0));
+        assert!(!us._can_redo());
+    }
+
+    #[test]
+    fn undostack_max_undo_evicts_oldest() {
+        let mut us = UndoStack::new();
+        for i in 0..=MAX_UNDO {
+            us.push_edit(snap(vec![&format!("line {}", i)], 0, 0));
+        }
+        // Should still have MAX_UNDO entries (oldest dropped)
+        let mut count = 0;
+        let mut current = snap(vec!["current"], 0, 0);
+        while let Some(prev) = us.do_undo(current.clone()) {
+            count += 1;
+            current = prev;
+        }
+        assert_eq!(count, MAX_UNDO);
+    }
+
+    // ── Editor::new ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn editor_new_has_one_empty_line() {
+        let ed = Editor::new(None);
+        assert_eq!(ed.lines, vec![""]);
+        assert_eq!(ed.cursor_row, 0);
+        assert_eq!(ed.cursor_col, 0);
+        assert!(!ed.modified);
+    }
+
+    // ── Editing ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn insert_char_ascii() {
+        let mut ed = make_editor("hello");
+        ed.cursor_col = 5;
+        ed.insert_char('!');
+        assert_eq!(ed.lines[0], "hello!");
+        assert_eq!(ed.cursor_col, 6);
+        assert!(ed.modified);
+    }
+
+    #[test]
+    fn insert_char_multibyte() {
+        let mut ed = make_editor("");
+        ed.insert_char('é');
+        assert_eq!(ed.lines[0], "é");
+        assert_eq!(ed.cursor_col, 2); // 'é' is 2 bytes
+    }
+
+    #[test]
+    fn insert_str_basic() {
+        let mut ed = make_editor("");
+        ed.insert_str("hello");
+        assert_eq!(ed.lines[0], "hello");
+        assert_eq!(ed.cursor_col, 5);
+    }
+
+    #[test]
+    fn insert_newline_no_indent() {
+        let mut ed = make_editor("hello world");
+        ed.cursor_col = 5;
+        ed.insert_newline(false);
+        assert_eq!(ed.lines.len(), 2);
+        assert_eq!(ed.lines[0], "hello");
+        assert_eq!(ed.lines[1], " world");
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    #[test]
+    fn insert_newline_with_auto_indent() {
+        let mut ed = make_editor("    hello");
+        ed.cursor_col = 9; // end of line
+        ed.insert_newline(true);
+        assert_eq!(ed.cursor_col, 4); // 4 spaces indent
+        assert_eq!(&ed.lines[1][..4], "    ");
+    }
+
+    #[test]
+    fn backspace_removes_char() {
+        let mut ed = make_editor("hello");
+        ed.cursor_col = 5;
+        ed.backspace();
+        assert_eq!(ed.lines[0], "hell");
+        assert_eq!(ed.cursor_col, 4);
+    }
+
+    #[test]
+    fn backspace_at_line_start_merges_lines() {
+        let mut ed = make_editor("hello\nworld");
+        ed.cursor_row = 1;
+        ed.cursor_col = 0;
+        ed.backspace();
+        assert_eq!(ed.lines.len(), 1);
+        assert_eq!(ed.lines[0], "helloworld");
+        assert_eq!(ed.cursor_row, 0);
+        assert_eq!(ed.cursor_col, 5);
+    }
+
+    #[test]
+    fn backspace_multibyte_char() {
+        let mut ed = make_editor("hé");
+        ed.cursor_col = 3; // after 'é' (2 bytes) + 'h' (1 byte)
+        ed.backspace();
+        assert_eq!(ed.lines[0], "h");
+        assert_eq!(ed.cursor_col, 1);
+    }
+
+    #[test]
+    fn delete_char_removes_forward() {
+        let mut ed = make_editor("hello");
+        ed.cursor_col = 0;
+        ed.delete_char();
+        assert_eq!(ed.lines[0], "ello");
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    #[test]
+    fn delete_char_at_line_end_merges() {
+        let mut ed = make_editor("hello\nworld");
+        ed.cursor_col = 5; // end of first line
+        ed.delete_char();
+        assert_eq!(ed.lines.len(), 1);
+        assert_eq!(ed.lines[0], "helloworld");
+    }
+
+    #[test]
+    fn delete_to_eol_truncates() {
+        let mut ed = make_editor("hello world");
+        ed.cursor_col = 5;
+        ed.delete_to_eol();
+        assert_eq!(ed.lines[0], "hello");
+        assert!(ed.modified);
+    }
+
+    #[test]
+    fn delete_word_before_removes_word() {
+        let mut ed = make_editor("hello world");
+        ed.cursor_col = 11; // end of "world"
+        ed.delete_word_before();
+        assert_eq!(ed.lines[0], "hello ");
+    }
+
+    #[test]
+    fn delete_word_before_at_col_zero_noop() {
+        let mut ed = make_editor("hello");
+        ed.cursor_col = 0;
+        ed.delete_word_before();
+        assert_eq!(ed.lines[0], "hello");
+    }
+
+    // ── Navigation ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn move_left_basic() {
+        let mut ed = make_editor("hello");
+        ed.cursor_col = 3;
+        ed.move_left();
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    #[test]
+    fn move_left_wraps_to_previous_line() {
+        let mut ed = make_editor("hello\nworld");
+        ed.cursor_row = 1;
+        ed.cursor_col = 0;
+        ed.move_left();
+        assert_eq!(ed.cursor_row, 0);
+        assert_eq!(ed.cursor_col, 5); // end of "hello"
+    }
+
+    #[test]
+    fn move_right_basic() {
+        let mut ed = make_editor("hello");
+        ed.cursor_col = 2;
+        ed.move_right();
+        assert_eq!(ed.cursor_col, 3);
+    }
+
+    #[test]
+    fn move_right_wraps_to_next_line() {
+        let mut ed = make_editor("hello\nworld");
+        ed.cursor_col = 5; // end of "hello"
+        ed.move_right();
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    #[test]
+    fn move_up_preserves_char_col() {
+        let mut ed = make_editor("hello\nhi");
+        ed.cursor_row = 1;
+        ed.cursor_col = 2; // char col 2, but "hi" is only 2 chars so col=2
+        ed.move_up();
+        assert_eq!(ed.cursor_row, 0);
+        // char col 2 in "hello" → byte col 2
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    #[test]
+    fn move_down_clamps_to_line_end() {
+        let mut ed = make_editor("hello world\nhi");
+        ed.cursor_col = 11; // end of first line
+        ed.move_down();
+        assert_eq!(ed.cursor_row, 1);
+        // "hi" has only 2 chars so cursor clamps at byte 2
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    #[test]
+    fn move_home_smart_first_press() {
+        let mut ed = make_editor("    hello");
+        ed.cursor_col = 9; // end of line
+        ed.move_home();
+        assert_eq!(ed.cursor_col, 4); // indent = 4 spaces
+    }
+
+    #[test]
+    fn move_home_smart_second_press() {
+        let mut ed = make_editor("    hello");
+        ed.cursor_col = 4; // already at indent
+        ed.move_home();
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    #[test]
+    fn move_end_goes_to_line_end() {
+        let mut ed = make_editor("hello");
+        ed.move_end();
+        assert_eq!(ed.cursor_col, 5);
+    }
+
+    #[test]
+    fn move_next_word_basic() {
+        let mut ed = make_editor("hello world");
+        ed.cursor_col = 0;
+        ed.move_next_word();
+        // "hello" is 5 chars; next word starts at 6
+        assert_eq!(ed.cursor_col, 6);
+    }
+
+    #[test]
+    fn move_prev_word_basic() {
+        let mut ed = make_editor("hello world");
+        ed.cursor_col = 11; // end
+        ed.move_prev_word();
+        assert_eq!(ed.cursor_col, 6); // start of "world"
+    }
+
+    #[test]
+    fn goto_line_basic() {
+        let mut ed = make_editor("a\nb\nc");
+        ed.goto_line(2);
+        assert_eq!(ed.cursor_row, 2);
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    #[test]
+    fn goto_line_clamped() {
+        let mut ed = make_editor("a\nb\nc");
+        ed.goto_line(100);
+        assert_eq!(ed.cursor_row, 2); // last line
+    }
+
+    #[test]
+    fn move_page_down_clamped() {
+        let mut ed = make_editor("a\nb\nc");
+        ed.cursor_row = 0;
+        ed.move_page_down(100);
+        assert_eq!(ed.cursor_row, 2);
+    }
+
+    #[test]
+    fn move_page_up_clamped() {
+        let mut ed = make_editor("a\nb\nc");
+        ed.cursor_row = 2;
+        ed.move_page_up(100);
+        assert_eq!(ed.cursor_row, 0);
+    }
+
+    #[test]
+    fn clamp_cursor_fixes_row() {
+        let mut ed = make_editor("hello");
+        ed.cursor_row = 100;
+        ed.clamp_cursor();
+        assert_eq!(ed.cursor_row, 0);
+    }
+
+    #[test]
+    fn clamp_cursor_fixes_col() {
+        let mut ed = make_editor("hi");
+        ed.cursor_col = 100;
+        ed.clamp_cursor();
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    // ── Selection ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn has_selection_false_without_anchor() {
+        let ed = make_editor("hello");
+        assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn has_selection_false_when_anchor_equals_cursor() {
+        let mut ed = make_editor("hello");
+        ed.selection_anchor = Some((0, 0));
+        assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn has_selection_true_when_different() {
+        let mut ed = make_editor("hello");
+        ed.selection_anchor = Some((0, 0));
+        ed.cursor_col = 3;
+        assert!(ed.has_selection());
+    }
+
+    #[test]
+    fn selection_ordered_forward() {
+        let mut ed = make_editor("hello");
+        ed.selection_anchor = Some((0, 1));
+        ed.cursor_col = 4;
+        let result = ed.selection_ordered().unwrap();
+        assert_eq!(result, ((0, 1), (0, 4)));
+    }
+
+    #[test]
+    fn selection_ordered_backward() {
+        let mut ed = make_editor("hello");
+        ed.selection_anchor = Some((0, 4));
+        ed.cursor_col = 1;
+        let result = ed.selection_ordered().unwrap();
+        assert_eq!(result, ((0, 1), (0, 4)));
+    }
+
+    #[test]
+    fn selection_ordered_none_when_equal() {
+        let mut ed = make_editor("hello");
+        ed.selection_anchor = Some((0, 2));
+        ed.cursor_col = 2;
+        assert!(ed.selection_ordered().is_none());
+    }
+
+    #[test]
+    fn get_selected_text_single_line() {
+        let mut ed = make_editor("hello world");
+        ed.selection_anchor = Some((0, 6));
+        ed.cursor_col = 11;
+        assert_eq!(ed.get_selected_text(), "world");
+    }
+
+    #[test]
+    fn get_selected_text_multiline() {
+        let mut ed = make_editor("hello\nworld");
+        ed.selection_anchor = Some((0, 3));
+        ed.cursor_row = 1;
+        ed.cursor_col = 3;
+        let text = ed.get_selected_text();
+        assert_eq!(text, "lo\nwor");
+    }
+
+    #[test]
+    fn select_all() {
+        let mut ed = make_editor("hello\nworld");
+        ed.select_all();
+        assert_eq!(ed.selection_anchor, Some((0, 0)));
+        assert_eq!(ed.cursor_row, 1);
+        assert_eq!(ed.cursor_col, 5);
+    }
+
+    #[test]
+    fn delete_selection_single_line() {
+        let mut ed = make_editor("hello world");
+        ed.selection_anchor = Some((0, 5));
+        ed.cursor_col = 11;
+        ed.delete_selection();
+        assert_eq!(ed.lines[0], "hello");
+        assert_eq!(ed.cursor_col, 5);
+        assert!(ed.selection_anchor.is_none());
+    }
+
+    #[test]
+    fn delete_selection_multiline() {
+        let mut ed = make_editor("hello\nworld");
+        ed.selection_anchor = Some((0, 2));
+        ed.cursor_row = 1;
+        ed.cursor_col = 3;
+        ed.delete_selection();
+        assert_eq!(ed.lines.len(), 1);
+        assert_eq!(ed.lines[0], "held");
+        assert_eq!(ed.cursor_row, 0);
+        assert_eq!(ed.cursor_col, 2);
+    }
+
+    // ── Clipboard ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn copy_line_stores_content() {
+        let mut ed = make_editor("hello");
+        ed.copy_line();
+        assert_eq!(ed.clipboard, "hello\n");
+        assert!(!ed.modified);
+        assert_eq!(ed.lines[0], "hello"); // unchanged
+    }
+
+    #[test]
+    fn copy_line_with_selection() {
+        let mut ed = make_editor("hello world");
+        ed.selection_anchor = Some((0, 6));
+        ed.cursor_col = 11;
+        ed.copy_line();
+        assert_eq!(ed.clipboard, "world");
+    }
+
+    #[test]
+    fn cut_line_removes_and_stores() {
+        let mut ed = make_editor("hello\nworld");
+        ed.cut_line();
+        assert_eq!(ed.clipboard, "hello\n");
+        assert_eq!(ed.lines, vec!["world"]);
+        assert!(ed.modified);
+    }
+
+    #[test]
+    fn cut_line_single_line_leaves_empty() {
+        let mut ed = make_editor("hello");
+        ed.cut_line();
+        assert_eq!(ed.lines, vec![""]);
+    }
+
+    #[test]
+    fn paste_empty_clipboard_noop() {
+        let mut ed = make_editor("hello");
+        ed.clipboard = String::new();
+        ed.paste();
+        assert_eq!(ed.lines[0], "hello");
+        assert!(!ed.modified);
+    }
+
+    #[test]
+    fn paste_inline() {
+        let mut ed = make_editor("helo");
+        ed.cursor_col = 3;
+        ed.clipboard = "l".to_string();
+        ed.paste();
+        assert_eq!(ed.lines[0], "hello");
+        assert_eq!(ed.cursor_col, 4);
+    }
+
+    #[test]
+    fn paste_multiline() {
+        let mut ed = make_editor("ac");
+        ed.cursor_col = 1;
+        ed.clipboard = "b\n".to_string(); // "b\n" splits into ["b", ""]
+        ed.paste();
+        assert_eq!(ed.lines, vec!["ab", "c"]);
+    }
+
+    // ── Undo / Redo ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn undo_reverts_insert() {
+        let mut ed = make_editor("hello");
+        ed.cursor_col = 5;
+        ed.insert_char('!');
+        assert_eq!(ed.lines[0], "hello!");
+        ed.do_undo();
+        assert_eq!(ed.lines[0], "hello");
+    }
+
+    #[test]
+    fn undo_nothing_sets_status() {
+        let mut ed = make_editor("hello");
+        ed.do_undo();
+        assert_eq!(ed.status_msg, "Nothing to undo");
+    }
+
+    #[test]
+    fn redo_reapplies_change() {
+        let mut ed = make_editor("hello");
+        ed.cursor_col = 5;
+        ed.insert_char('!');
+        ed.do_undo();
+        ed.do_redo();
+        assert_eq!(ed.lines[0], "hello!");
+    }
+
+    #[test]
+    fn redo_nothing_sets_status() {
+        let mut ed = make_editor("hello");
+        ed.do_redo();
+        assert_eq!(ed.status_msg, "Nothing to redo");
+    }
+
+    #[test]
+    fn multiple_undo_steps() {
+        let mut ed = make_editor("");
+        ed.insert_char('a');
+        ed.insert_char('b');
+        ed.insert_char('c');
+        ed.do_undo();
+        assert_eq!(ed.lines[0], "ab");
+        ed.do_undo();
+        assert_eq!(ed.lines[0], "a");
+        ed.do_undo();
+        assert_eq!(ed.lines[0], "");
+    }
+
+    // ── Search ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_search_matches_empty_term() {
+        let mut ed = make_editor("hello world");
+        ed.search_term = String::new();
+        ed.build_search_matches();
+        assert!(ed.search_matches.is_empty());
+    }
+
+    #[test]
+    fn build_search_matches_finds_matches() {
+        let mut ed = make_editor("hello world hello");
+        ed.search_term = "hello".to_string();
+        ed.build_search_matches();
+        assert_eq!(ed.search_matches.len(), 2);
+        assert_eq!(ed.search_matches[0], (0, 0));
+        assert_eq!(ed.search_matches[1], (0, 12));
+    }
+
+    #[test]
+    fn build_search_matches_case_insensitive() {
+        let mut ed = make_editor("Hello HELLO hello");
+        ed.search_term = "hello".to_string();
+        ed.build_search_matches();
+        assert_eq!(ed.search_matches.len(), 3);
+    }
+
+    #[test]
+    fn search_next_moves_cursor() {
+        let mut ed = make_editor("hello world");
+        ed.search_term = "world".to_string();
+        ed.build_search_matches();
+        ed.cursor_col = 0;
+        let found = ed.search_next();
+        assert!(found);
+        assert_eq!(ed.cursor_col, 6);
+    }
+
+    #[test]
+    fn search_next_wraps_around() {
+        let mut ed = make_editor("hello world");
+        ed.search_term = "hello".to_string();
+        ed.build_search_matches();
+        ed.cursor_col = 5; // past "hello"
+        ed.search_next(); // wraps to the only match
+        assert_eq!(ed.cursor_col, 0);
+    }
+
+    #[test]
+    fn search_next_no_matches_returns_false() {
+        let mut ed = make_editor("hello world");
+        ed.search_term = "xyz".to_string();
+        ed.build_search_matches();
+        assert!(!ed.search_next());
+    }
+
+    #[test]
+    fn search_prev_moves_cursor_backward() {
+        let mut ed = make_editor("hello hello");
+        ed.search_term = "hello".to_string();
+        ed.build_search_matches();
+        ed.cursor_col = 10; // at second match area
+        ed.search_prev();
+        assert_eq!(ed.cursor_col, 6);
+    }
+
+    #[test]
+    fn search_prev_wraps_around() {
+        let mut ed = make_editor("hello hello");
+        ed.search_term = "hello".to_string();
+        ed.build_search_matches();
+        ed.cursor_col = 0;
+        ed.search_prev(); // wraps to last match
+        assert_eq!(ed.cursor_col, 6);
+    }
+
+    #[test]
+    fn replace_all_empty_term_returns_zero() {
+        let mut ed = make_editor("hello world");
+        let count = ed.replace_all("", "replacement");
+        assert_eq!(count, 0);
+        assert!(!ed.modified);
+    }
+
+    #[test]
+    fn replace_all_replaces_and_returns_count() {
+        let mut ed = make_editor("hello hello world");
+        let count = ed.replace_all("hello", "bye");
+        assert_eq!(count, 2);
+        assert_eq!(ed.lines[0], "bye bye world");
+        assert!(ed.modified);
+    }
+
+    #[test]
+    fn replace_all_no_match_not_modified() {
+        let mut ed = make_editor("hello world");
+        ed.modified = false;
+        let count = ed.replace_all("xyz", "abc");
+        assert_eq!(count, 0);
+        assert!(!ed.modified);
+    }
+
+    // ── Scrolling ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn update_scroll_scrolls_down() {
+        let mut ed = make_editor("a\nb\nc\nd\ne");
+        ed.cursor_row = 4;
+        ed.scroll_row = 0;
+        ed.update_scroll(3, 80);
+        assert_eq!(ed.scroll_row, 2); // cursor_row(4) + 1 - height(3)
+    }
+
+    #[test]
+    fn update_scroll_scrolls_up() {
+        let mut ed = make_editor("a\nb\nc\nd\ne");
+        ed.cursor_row = 1;
+        ed.scroll_row = 3;
+        ed.update_scroll(3, 80);
+        assert_eq!(ed.scroll_row, 1);
+    }
+
+    #[test]
+    fn update_scroll_horizontal() {
+        let mut ed = make_editor("hello world this is a long line");
+        ed.cursor_col = 30;
+        ed.scroll_col = 0;
+        ed.update_scroll(20, 10);
+        // char_col = 30, scroll_col should be 30 + 1 - 10 = 21
+        assert_eq!(ed.scroll_col, 21);
+    }
+}
