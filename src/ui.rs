@@ -9,7 +9,7 @@ use crossterm::{
     terminal,
 };
 
-use crate::config::{config_path, keybindings_path, Config, KeyBindings};
+use crate::config::{config_path, keybindings_path, Action, Config, KeyBindings};
 use crate::editor::Editor;
 
 /// Width (in columns) of the line-number gutter, or 0 if disabled.
@@ -363,33 +363,33 @@ fn draw_status_bar(stdout: &mut impl Write, editor: &Editor, h: usize, w: usize)
 }
 
 fn draw_help_bar(stdout: &mut impl Write, kb: &KeyBindings, h: usize, w: usize) -> io::Result<()> {
-    let row1: &[(&str, &str)] = &[
-        ("quit",      "Quit"),
-        ("save",      "Save"),
-        ("search",    "Search"),
-        ("replace",   "Replace"),
-        ("goto_line", "GoTo"),
-        ("undo",      "Undo"),
+    let row1: &[(Action, &str)] = &[
+        (Action::Quit,     "Quit"),
+        (Action::Save,     "Save"),
+        (Action::Search,   "Search"),
+        (Action::Replace,  "Replace"),
+        (Action::GotoLine, "GoTo"),
+        (Action::Undo,     "Undo"),
     ];
-    let row2: &[(&str, &str)] = &[
-        ("cut_line",  "Cut"),
-        ("copy_line", "Copy"),
-        ("paste",     "Paste"),
-        ("select_all","Sel All"),
-        ("redo",      "Redo"),
-        ("open_file", "Open"),
-        ("help",      "Help"),
+    let row2: &[(Action, &str)] = &[
+        (Action::CutLine,   "Cut"),
+        (Action::CopyLine,  "Copy"),
+        (Action::Paste,     "Paste"),
+        (Action::SelectAll, "Sel All"),
+        (Action::Redo,      "Redo"),
+        (Action::OpenFile,  "Open"),
+        (Action::Help,      "Help"),
     ];
 
     // Compute per-column widths so both rows align.
     let ncols = row1.len().max(row2.len());
-    let entry_width = |action: &str, label: &str| {
+    let entry_width = |action: Action, label: &str| {
         kb.first_key(action).chars().count() + 1 + label.chars().count()
     };
     let col_widths: Vec<usize> = (0..ncols)
         .map(|i| {
-            let w1 = row1.get(i).map(|(a, l)| entry_width(a, l)).unwrap_or(0);
-            let w2 = row2.get(i).map(|(a, l)| entry_width(a, l)).unwrap_or(0);
+            let w1 = row1.get(i).map(|(a, l)| entry_width(*a, l)).unwrap_or(0);
+            let w2 = row2.get(i).map(|(a, l)| entry_width(*a, l)).unwrap_or(0);
             w1.max(w2)
         })
         .collect();
@@ -400,7 +400,7 @@ fn draw_help_bar(stdout: &mut impl Write, kb: &KeyBindings, h: usize, w: usize) 
 
 fn draw_help_row(
     stdout: &mut impl Write,
-    shortcuts: &[(&str, &str)],
+    shortcuts: &[(Action, &str)],
     kb: &KeyBindings,
     y: u16,
     w: usize,
@@ -422,7 +422,7 @@ fn draw_help_row(
     let mut first = true;
 
     for (i, (action, label)) in shortcuts.iter().enumerate() {
-        let key = kb.first_key(action);
+        let key = kb.first_key(*action);
         let col_w = col_widths.get(i).copied().unwrap_or(0);
         let entry_w = key.chars().count() + 1 + label.chars().count();
         let pad = col_w.saturating_sub(entry_w);
@@ -843,10 +843,10 @@ pub fn show_help(
         String::new(),
     ];
 
-    let mut sorted: Vec<(&String, &Vec<String>)> = kb.bindings.iter().collect();
-    sorted.sort_by_key(|(k, _)| k.as_str());
+    let mut sorted: Vec<(&Action, &Vec<String>)> = kb.bindings.iter().collect();
+    sorted.sort_by_key(|(k, _)| k.to_string());
     for (action, keys) in sorted {
-        let label = action.replace('_', " ");
+        let label = action.to_string().replace('_', " ");
         let keys_str = keys.join(" / ");
         lines.push(format!("  {:<22} {}", keys_str, label));
     }

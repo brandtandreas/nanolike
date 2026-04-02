@@ -10,7 +10,7 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-use config::{config_path, keybindings_path, Config, KeyBindings};
+use config::{config_path, keybindings_path, Action, Config, KeyBindings};
 use editor::Editor;
 
 // ── Key event → name string ───────────────────────────────────────────────────
@@ -304,12 +304,12 @@ impl App {
 
     // ── Action dispatch ───────────────────────────────────────────────────────
 
-    fn handle_action(&mut self, action: &str) -> io::Result<()> {
+    fn handle_action(&mut self, action: Action) -> io::Result<()> {
         let t = self.active_tab;
         match action {
-            "quit" => self.handle_quit()?,
+            Action::Quit => self.handle_quit()?,
 
-            "save" => {
+            Action::Save => {
                 let fname = self.editors[t].filename.clone();
                 if let Some(fname) = fname {
                     self.editors[t].save_file(&fname);
@@ -323,7 +323,7 @@ impl App {
                 }
             }
 
-            "save_as" => {
+            Action::SaveAs => {
                 let default = self.editors[t].filename.clone().unwrap_or_default();
                 match self.prompt("Save as: ", &default)? {
                     Some(fname) if !fname.is_empty() => {
@@ -333,15 +333,15 @@ impl App {
                 }
             }
 
-            "help" => {
+            Action::Help => {
                 ui::show_help(&mut self.stdout, &self.kb, self.term_h, self.term_w)?;
             }
 
-            "cut_line"  => self.editors[t].cut_line(),
-            "copy_line" => self.editors[t].copy_line(),
-            "paste"     => self.editors[t].paste(),
+            Action::CutLine  => self.editors[t].cut_line(),
+            Action::CopyLine => self.editors[t].copy_line(),
+            Action::Paste    => self.editors[t].paste(),
 
-            "search" => {
+            Action::Search => {
                 let default = self.editors[t].search_term.clone();
                 match self.prompt("Search: ", &default)? {
                     Some(term) if !term.is_empty() => {
@@ -364,9 +364,9 @@ impl App {
                 }
             }
 
-            "search_next" => {
+            Action::SearchNext => {
                 if self.editors[t].search_term.is_empty() {
-                    self.handle_action("search")?;
+                    self.handle_action(Action::Search)?;
                 } else {
                     self.editors[self.active_tab].build_search_matches();
                     if !self.editors[self.active_tab].search_next() {
@@ -377,9 +377,9 @@ impl App {
                 }
             }
 
-            "search_prev" => {
+            Action::SearchPrev => {
                 if self.editors[t].search_term.is_empty() {
-                    self.handle_action("search")?;
+                    self.handle_action(Action::Search)?;
                 } else {
                     self.editors[self.active_tab].build_search_matches();
                     if !self.editors[self.active_tab].search_prev() {
@@ -390,36 +390,36 @@ impl App {
                 }
             }
 
-            "replace" => self.handle_replace()?,
+            Action::Replace => self.handle_replace()?,
 
-            "goto_line" => self.handle_goto_line()?,
+            Action::GotoLine => self.handle_goto_line()?,
 
-            "page_up"   => { let h = self.text_height(); self.editors[t].move_page_up(h); }
-            "page_down" => { let h = self.text_height(); self.editors[t].move_page_down(h); }
+            Action::PageUp   => { let h = self.text_height(); self.editors[t].move_page_up(h); }
+            Action::PageDown => { let h = self.text_height(); self.editors[t].move_page_down(h); }
 
-            "file_top" => {
+            Action::FileTop => {
                 self.editors[t].selection_anchor = None;
                 self.editors[t].cursor_row = 0;
                 self.editors[t].cursor_col = 0;
             }
-            "file_bottom" => {
+            Action::FileBottom => {
                 self.editors[t].selection_anchor = None;
                 self.editors[t].cursor_row = self.editors[t].lines.len().saturating_sub(1);
                 self.editors[t].cursor_col =
                     self.editors[t].lines.last().map(|l| l.len()).unwrap_or(0);
             }
 
-            "select_all" => self.editors[t].select_all(),
+            Action::SelectAll => self.editors[t].select_all(),
 
-            "undo" => self.editors[t].do_undo(),
-            "redo" => self.editors[t].do_redo(),
+            Action::Undo => self.editors[t].do_undo(),
+            Action::Redo => self.editors[t].do_redo(),
 
-            "next_word"    => self.editors[t].move_next_word(),
-            "prev_word"    => self.editors[t].move_prev_word(),
-            "delete_word"  => self.editors[t].delete_word_before(),
-            "delete_to_eol"=> self.editors[t].delete_to_eol(),
+            Action::NextWord   => self.editors[t].move_next_word(),
+            Action::PrevWord   => self.editors[t].move_prev_word(),
+            Action::DeleteWord => self.editors[t].delete_word_before(),
+            Action::DeleteToEol=> self.editors[t].delete_to_eol(),
 
-            "toggle_line_numbers" => {
+            Action::ToggleLineNumbers => {
                 self.config.line_numbers = !self.config.line_numbers;
                 self.config.save();
                 let on = self.config.line_numbers;
@@ -428,14 +428,14 @@ impl App {
                     false,
                 );
             }
-            "toggle_word_wrap" => {
+            Action::ToggleWordWrap => {
                 self.config.word_wrap = !self.config.word_wrap;
                 self.config.save();
                 let on = self.config.word_wrap;
                 self.editors[t]
                     .set_status(format!("Word wrap {}", if on { "on" } else { "off" }), false);
             }
-            "toggle_auto_indent" => {
+            Action::ToggleAutoIndent => {
                 self.config.auto_indent = !self.config.auto_indent;
                 self.config.save();
                 let on = self.config.auto_indent;
@@ -445,26 +445,24 @@ impl App {
                 );
             }
 
-            "open_file" => self.handle_open_file()?,
+            Action::OpenFile => self.handle_open_file()?,
 
-            "next_tab" => {
+            Action::NextTab => {
                 if self.editors.len() > 1 {
                     self.active_tab = (self.active_tab + 1) % self.editors.len();
                 }
             }
-            "prev_tab" => {
+            Action::PrevTab => {
                 if self.editors.len() > 1 {
                     self.active_tab =
                         (self.active_tab + self.editors.len() - 1) % self.editors.len();
                 }
             }
-            "close_tab" => self.handle_close_tab()?,
-            "new_tab"   => {
+            Action::CloseTab => self.handle_close_tab()?,
+            Action::NewTab   => {
                 self.editors.push(Editor::new(None));
                 self.active_tab = self.editors.len() - 1;
             }
-
-            _ => {}
         }
         Ok(())
     }
@@ -598,8 +596,8 @@ impl App {
 
         // ── Keybinding lookup ─────────────────────────────────────────────────
         let key_name = key_event_to_name(&ev);
-        if let Some(action) = self.kb.get_action(&key_name).map(|s| s.to_string()) {
-            return self.handle_action(&action);
+        if let Some(action) = self.kb.get_action(&key_name) {
+            return self.handle_action(action);
         }
 
         // ── Printable character fallthrough ───────────────────────────────────
