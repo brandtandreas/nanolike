@@ -151,13 +151,16 @@ fn draw_tab_bar(
     queue!(stdout, ResetColor)
 }
 
-/// Builds the set of (row, byte_offset) pairs that fall inside the current selection.
-fn build_selection_set(editor: &Editor) -> HashSet<(usize, usize)> {
+/// Builds the set of (row, byte_offset) pairs that fall inside the current selection,
+/// restricted to the visible row range `[first_row, last_row]`.
+fn build_selection_set(editor: &Editor, first_row: usize, last_row: usize) -> HashSet<(usize, usize)> {
     let mut set = HashSet::new();
     let Some(((sr, sc), (er, ec))) = editor.selection_ordered() else {
         return set;
     };
-    for row in sr..=er {
+    let row_start = sr.max(first_row);
+    let row_end   = er.min(last_row);
+    for row in row_start..=row_end {
         if row >= editor.lines.len() {
             break;
         }
@@ -177,13 +180,16 @@ fn build_selection_set(editor: &Editor) -> HashSet<(usize, usize)> {
     set
 }
 
-/// Builds the set of (row, byte_offset) pairs that should be highlighted as search matches.
-fn build_search_highlight_set(editor: &Editor) -> HashSet<(usize, usize)> {
+/// Builds the set of (row, byte_offset) pairs that should be highlighted as search matches,
+/// restricted to the visible row range `[first_row, last_row]`.
+fn build_search_highlight_set(editor: &Editor, first_row: usize, last_row: usize) -> HashSet<(usize, usize)> {
     let mut set = HashSet::new();
     if editor.search_term.is_empty() {
         return set;
     }
     for &(row, start_col) in &editor.search_matches {
+        if row < first_row { continue; }
+        if row > last_row  { break; }
         if row >= editor.lines.len() {
             continue;
         }
@@ -212,16 +218,11 @@ fn render_line(
     sel_set: &HashSet<(usize, usize)>,
 ) -> io::Result<()> {
     let line = &editor.lines[file_row];
-    let visible: Vec<(usize, char)> = line
-        .char_indices()
-        .skip(editor.scroll_col)
-        .take(text_width)
-        .collect();
-
-    let printed = visible.len();
-    for (byte_pos, ch) in &visible {
-        let in_sel    = sel_set.contains(&(file_row, *byte_pos));
-        let in_search = search_set.contains(&(file_row, *byte_pos));
+    let mut printed = 0usize;
+    for (byte_pos, ch) in line.char_indices().skip(editor.scroll_col).take(text_width) {
+        printed += 1;
+        let in_sel    = sel_set.contains(&(file_row, byte_pos));
+        let in_search = search_set.contains(&(file_row, byte_pos));
         if in_sel {
             queue!(
                 stdout,
@@ -267,8 +268,10 @@ fn draw_text_area(
     lnw: usize,
     w: usize,
 ) -> io::Result<()> {
-    let search_set = build_search_highlight_set(editor);
-    let sel_set    = build_selection_set(editor);
+    let first_row  = editor.scroll_row;
+    let last_row   = editor.scroll_row.saturating_add(text_height).saturating_sub(1);
+    let search_set = build_search_highlight_set(editor, first_row, last_row);
+    let sel_set    = build_selection_set(editor, first_row, last_row);
 
     for screen_row in 0..text_height {
         let file_row = screen_row + editor.scroll_row;

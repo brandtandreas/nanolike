@@ -81,6 +81,8 @@ pub struct Editor {
     /// (row, byte_col) of each match start.
     pub search_matches: Vec<(usize, usize)>,
     pub search_idx: usize,
+    /// True when the document has been edited since the last `build_search_matches()` call.
+    pub search_dirty: bool,
     /// The encoding detected when the file was opened (default UTF-8 for new files).
     pub encoding: &'static Encoding,
     /// Whether the file had a byte-order mark (BOM); preserved on save.
@@ -106,6 +108,7 @@ impl Editor {
             search_term: String::new(),
             search_matches: Vec::new(),
             search_idx: 0,
+            search_dirty: false,
             encoding: encoding_rs::UTF_8,
             has_bom: false,
         };
@@ -182,6 +185,7 @@ impl Editor {
     fn save_undo(&mut self) {
         let snap = self.snapshot();
         self.undo_stack.push_edit(snap);
+        self.search_dirty = true;
     }
 
     fn apply_snapshot(&mut self, snap: Snapshot) {
@@ -557,11 +561,12 @@ impl Editor {
     }
 
     pub fn move_next_word(&mut self) {
-        let chars: Vec<(usize, char)> = self.lines[self.cursor_row].char_indices().collect();
-        let mut idx = chars
-            .iter()
-            .position(|&(b, _)| b >= self.cursor_col)
-            .unwrap_or(chars.len());
+        // Only collect the suffix from the cursor onward, not the whole line.
+        let chars: Vec<(usize, char)> = self.lines[self.cursor_row][self.cursor_col..]
+            .char_indices()
+            .map(|(i, c)| (self.cursor_col + i, c))
+            .collect();
+        let mut idx = 0;
         while idx < chars.len() && (chars[idx].1.is_alphanumeric() || chars[idx].1 == '_') {
             idx += 1;
         }
@@ -573,12 +578,11 @@ impl Editor {
     }
 
     pub fn move_prev_word(&mut self) {
-        let chars: Vec<(usize, char)> = self.lines[self.cursor_row].char_indices().collect();
-        let mut idx = chars
-            .iter()
-            .rposition(|&(b, _)| b < self.cursor_col)
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        // Only collect the prefix up to the cursor, not the whole line.
+        let chars: Vec<(usize, char)> = self.lines[self.cursor_row][..self.cursor_col]
+            .char_indices()
+            .collect();
+        let mut idx = chars.len();
         while idx > 0 && !(chars[idx - 1].1.is_alphanumeric() || chars[idx - 1].1 == '_') {
             idx -= 1;
         }
@@ -667,6 +671,7 @@ impl Editor {
 
     pub fn build_search_matches(&mut self) {
         self.search_matches.clear();
+        self.search_dirty = false;
         if self.search_term.is_empty() {
             return;
         }
@@ -756,10 +761,11 @@ impl Editor {
         self.save_undo();
         let mut count = 0usize;
         for line in &mut self.lines {
-            let occurrences = line.matches(term).count();
-            if occurrences > 0 {
-                count += occurrences;
-                *line = line.replace(term, replacement);
+            let parts: Vec<&str> = line.split(term).collect();
+            let n = parts.len().saturating_sub(1);
+            if n > 0 {
+                *line = parts.join(replacement);
+                count += n;
             }
         }
         if count > 0 {

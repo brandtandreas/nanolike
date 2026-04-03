@@ -368,7 +368,9 @@ impl App {
                 if self.editors[t].search_term.is_empty() {
                     self.handle_action(Action::Search)?;
                 } else {
-                    self.editors[self.active_tab].build_search_matches();
+                    if self.editors[self.active_tab].search_dirty {
+                        self.editors[self.active_tab].build_search_matches();
+                    }
                     if !self.editors[self.active_tab].search_next() {
                         let msg =
                             format!("Not found: {}", self.editors[self.active_tab].search_term);
@@ -381,7 +383,9 @@ impl App {
                 if self.editors[t].search_term.is_empty() {
                     self.handle_action(Action::Search)?;
                 } else {
-                    self.editors[self.active_tab].build_search_matches();
+                    if self.editors[self.active_tab].search_dirty {
+                        self.editors[self.active_tab].build_search_matches();
+                    }
                     if !self.editors[self.active_tab].search_prev() {
                         let msg =
                             format!("Not found: {}", self.editors[self.active_tab].search_term);
@@ -627,11 +631,11 @@ impl App {
         execute!(self.stdout, EnterAlternateScreen)?;
         let _guard = TerminalGuard;
 
-        while self.running {
-            let (w, h) = terminal::size()?;
-            self.term_w = w as usize;
-            self.term_h = h as usize;
+        let (w, h) = terminal::size()?;
+        self.term_w = w as usize;
+        self.term_h = h as usize;
 
+        while self.running {
             let th = self.text_height();
             let tw = self.text_width();
             self.editors[self.active_tab].update_scroll(th, tw);
